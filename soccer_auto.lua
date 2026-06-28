@@ -1,6 +1,6 @@
 --[[
     ================================================================
-       SOCCER EVENT AUTO  v5.12.1  —  Pet Sim 99 / Soccer Event
+       SOCCER EVENT AUTO  v5.13  —  Pet Sim 99 / Soccer Event
     ================================================================
     Полностью исследовано вживую через Roblox MCP (placeId 8737899170,
     executor Volt 1.2.24.3). Все механики подтверждены на реальной игре.
@@ -14,6 +14,7 @@
         (server-side, не конфликтует с киком). Стой на яйце — скрипт держит
         авто-хэтч включённым.
       • Умные апгрейды: тратит SoccerOrbs по приоритету (доход / 100% крит).
+      • Авто-экип лучших питомцев: PetCmds.EquipBest + авто-экип игры для новых.
       • Анти-АФК: VirtualUser + Players.Idled (проверено).
       • Оптимизация игры (обратимая): FPS-cap, отключение пост-эффектов,
         понижение качества рендера.
@@ -39,6 +40,7 @@ local CONFIG = {
     AUTO_KICK    = true,   -- кастомный быстрый кик (InfiniteShoot)
     AUTO_HATCH   = true,   -- авто-открытие кастом-яйца (CustomEggs_Hatch)
     AUTO_UPGRADE = true,
+    AUTO_EQUIP_PETS = true,  -- PetCmds.EquipBest (лучшие по урону/силе)
     ANTI_AFK     = true,
     OPTIMIZE_GAME = true,  -- обратимая оптимизация графики
 
@@ -57,6 +59,11 @@ local CONFIG = {
     -- Апгрейды
     UPGRADE_INTERVAL = 2.0,
     ORB_RESERVE      = 0,
+
+    -- Экип питомцев (PetCmds.EquipBest → Pets_EquipBest LD_BestFit)
+    EQUIP_BEST_INTERVAL = 30,   -- периодический пересчёт лучшего экипа (сек)
+    EQUIP_BEST_COOLDOWN = 8,    -- мин. пауза между вызовами EquipBest (сек)
+    EQUIP_ENSURE_AUTO   = true, -- включить встроенный авто-экип игры (новые петы)
     PRIORITIZE_100_PERCENT = false, -- сперва Critical+Trickshot до 100%
     UPGRADE_PRIORITY = {
         "SoccerYeetOrbStrength", "SoccerYeetOrbsReach", "SoccerBetterYeetEgg",
@@ -264,6 +271,7 @@ local CurrencyCmds     = safeRequire(Client:FindFirstChild("CurrencyCmds"))
 local Hatching         = safeRequire(Client:FindFirstChild("HatchingCmds"))
 local EggCmds          = safeRequire(Client:FindFirstChild("EggCmds"))
 local CustomEggsCmds   = safeRequire(Client:FindFirstChild("CustomEggsCmds"))
+local PetCmds          = safeRequire(Client:FindFirstChild("PetCmds"))
 local LoginStreakCmds  = safeRequire(Client:FindFirstChild("LoginStreakCmds"))
 local ConsumableCmds   = safeRequire(Client:FindFirstChild("ConsumableCmds"))
 local SaveCmds         = safeRequire(Client:FindFirstChild("Save"))
@@ -278,6 +286,7 @@ local Rf_ForeverFree = Network:FindFirstChild("ForeverPacks: Claim Free")
 local Rf_ZonePurchase = Network:FindFirstChild("InstanceZones_RequestPurchase")
 local Ev_MoveServer  = Network:FindFirstChild("Move Server")
 local Ev_GraphicsSet = Network:FindFirstChild("PlayerGraphicsSetting_Set")
+local Ev_EquipBest   = Network:FindFirstChild("Pets_EquipBest")
 
 local UpgradeDefsFolder
 do
@@ -1164,6 +1173,9 @@ do
             Runtime._eggWaitLogged = false
             Runtime._latchedBooth = uid
             Runtime._latchedHatchOk = true
+            if CONFIG.AUTO_EQUIP_PETS then
+                PetEquip.afterHatch()
+            end
             return true
         end
         if center and getHRP() then
@@ -1323,6 +1335,78 @@ do
             print(("[SoccerAuto] Апгрейд %s куплен за %d орбов (%s).")
                 :format(pick.id, pick.cost, mode))
         end
+    end
+end
+
+----------------------------------------------------------------
+-- 4b) АВТО-ЭКИП ЛУЧШИХ ПИТОМЦЕВ  (PetCmds.EquipBest — проверено MCP)
+----------------------------------------------------------------
+local PetEquip = {}
+do
+    local lastEquipAt = 0
+    local lastEquippedN = -1
+
+    local function countEquipped()
+        if not PetCmds then return 0 end
+        local ok, items = pcall(PetCmds.GetEquippedItems)
+        if ok and type(items) == "table" then return #items end
+        return 0
+    end
+
+    local function maxSlots()
+        if not PetCmds then return 0 end
+        local ok, n = pcall(PetCmds.GetMaxEquipped)
+        return (ok and type(n) == "number") and n or 0
+    end
+
+    local function ensureGameAutoEquip()
+        if not CONFIG.EQUIP_ENSURE_AUTO or not PetCmds then return end
+        local ok, on = pcall(PetCmds.IsAutoEquipEnabled)
+        if ok and on == false and type(PetCmds.ToggleAutoEquip) == "function" then
+            pcall(PetCmds.ToggleAutoEquip)
+        end
+    end
+
+    local function fireEquipBest()
+        if PetCmds and type(PetCmds.EquipBest) == "function" then
+            local ok = pcall(PetCmds.EquipBest)
+            if ok then return true end
+        end
+        if Ev_EquipBest then
+            return pcall(Ev_EquipBest.FireServer, Ev_EquipBest, "LD_BestFit")
+        end
+        return false
+    end
+
+    function PetEquip.tick(force)
+        if not CONFIG.AUTO_EQUIP_PETS or not PetCmds then return end
+        local now = os.clock()
+        local cd = CONFIG.EQUIP_BEST_COOLDOWN or 8
+        if not force and (now - lastEquipAt) < cd then return end
+
+        if not force then
+            local ok, maxed = pcall(PetCmds.IsMaxEquipped)
+            if ok and maxed == true then return end
+        end
+
+        ensureGameAutoEquip()
+        local before = countEquipped()
+        if not fireEquipBest() then return end
+        lastEquipAt = now
+
+        task.defer(function()
+            task.wait(0.35)
+            local after = countEquipped()
+            local max = maxSlots()
+            if after ~= lastEquippedN or (force and after ~= before) then
+                lastEquippedN = after
+                print(("[SoccerAuto] Экип лучших питомцев: %d/%d"):format(after, max))
+            end
+        end)
+    end
+
+    function PetEquip.afterHatch()
+        PetEquip.tick(true)
     end
 end
 
@@ -1597,6 +1681,7 @@ local function setupMaintenanceLoops()
             if inSoccer() and not isPlaying() then
                 safe("claims", claimsTick)
                 safe("upgrade", Upgrades.tick)
+                safe("equip", function() PetEquip.tick(false) end)
             end
             task.wait(2.0)
         end)
@@ -1661,18 +1746,32 @@ function App.Status()
         local ok, z = pcall(InstanceZoneCmds.GetMaximumOwnedZoneNumber)
         zoneInfo = (" | zone=%s/%d"):format(ok and tostring(z) or "?", CONFIG.MAX_SOCCER_ZONE or 5)
     end
-    print(("[SoccerAuto] kicks=%d orbs=%d hatches=%d upgrades=%d claims=%d errors=%d running=%s playing=%s%s%s")
+    local petInfo = ""
+    if PetCmds then
+        local ok, items = pcall(PetCmds.GetEquippedItems)
+        local ok2, max = pcall(PetCmds.GetMaxEquipped)
+        if ok and ok2 then
+            petInfo = (" | pets=%d/%d"):format(type(items) == "table" and #items or 0, max or 0)
+        end
+    end
+    print(("[SoccerAuto] kicks=%d orbs=%d hatches=%d upgrades=%d claims=%d errors=%d running=%s playing=%s%s%s%s")
         :format(s.kicks, s.orbs, s.hatches, s.upgrades, s.claims, s.errors,
-            tostring(Runtime.running), tostring(isPlaying()), credits, zoneInfo))
+            tostring(Runtime.running), tostring(isPlaying()), credits, zoneInfo, petInfo))
     return s
 end
 
 ----------------------------------------------------------------
 -- ЗАПУСК
 ----------------------------------------------------------------
-print(("[SoccerAuto] v5.12.1 старт | executor=%s"):format(tostring(U.identify())))
+print(("[SoccerAuto] v5.13 старт | executor=%s"):format(tostring(U.identify())))
 
 ensureInSoccer()
+if CONFIG.AUTO_EQUIP_PETS then
+    task.defer(function()
+        task.wait(2)
+        if Runtime.running then safe("equip", function() PetEquip.tick(true) end) end
+    end)
+end
 if CONFIG.COLLECT_ORBS then safe("orbListeners", OrbCollector.setupListeners) end
 if CONFIG.AUTO_ZONE_PROGRESS then
     task.spawn(function()
@@ -1719,14 +1818,22 @@ end
 
 -- Поток апгрейдов (низкая частота)
 if CONFIG.AUTO_UPGRADE then
-    spawnLoop("maint", function()
+    spawnLoop("upgrade", function()
         safe("upgrade", Upgrades.tick)
         task.wait(CONFIG.UPGRADE_INTERVAL)
     end)
 end
 
-print(("[SoccerAuto] Готов | Орбы:%s Кик:%s Хэтч:%s Апгр:%s Клейм:%s Вход:%s Зоны:%s Телепорт:%s АнтиАФК:%s")
+if CONFIG.AUTO_EQUIP_PETS then
+    spawnLoop("equip", function()
+        safe("equip", function() PetEquip.tick(false) end)
+        task.wait(CONFIG.EQUIP_BEST_INTERVAL or 30)
+    end)
+end
+
+print(("[SoccerAuto] Готов | Орбы:%s Кик:%s Хэтч:%s Апгр:%s Экип:%s Клейм:%s Вход:%s Зоны:%s Телепорт:%s АнтиАФК:%s")
     :format(tostring(CONFIG.COLLECT_ORBS), tostring(CONFIG.AUTO_KICK), tostring(CONFIG.AUTO_HATCH),
-        tostring(CONFIG.AUTO_UPGRADE), tostring(CONFIG.AUTO_CLAIM), tostring(CONFIG.AUTO_ENTER),
-        tostring(CONFIG.AUTO_ZONE_PROGRESS), tostring(CONFIG.AUTO_TELEPORT_EGG), tostring(CONFIG.ANTI_AFK)))
+        tostring(CONFIG.AUTO_UPGRADE), tostring(CONFIG.AUTO_EQUIP_PETS), tostring(CONFIG.AUTO_CLAIM),
+        tostring(CONFIG.AUTO_ENTER), tostring(CONFIG.AUTO_ZONE_PROGRESS),
+        tostring(CONFIG.AUTO_TELEPORT_EGG), tostring(CONFIG.ANTI_AFK)))
 print("[SoccerAuto] Стоп: getgenv().__SoccerAuto.Stop()  |  Статус: getgenv().__SoccerAuto.Status()")
