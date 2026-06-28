@@ -1,6 +1,6 @@
 --[[
     ================================================================
-       SOCCER EVENT AUTO  v5.17  —  Pet Sim 99 / Soccer Event
+       SOCCER EVENT AUTO  v5.18  —  Pet Sim 99 / Soccer Event
     ================================================================
     Полностью исследовано вживую через Roblox MCP (placeId 8737899170,
     executor Volt 1.2.24.3). Все механики подтверждены на реальной игре.
@@ -308,12 +308,24 @@ local function inSoccer()
     return ok and res == true
 end
 
--- Идёт ли активный раунд (не intermission). Если не знаем — считаем что да.
+-- Активный раунд (не intermission). При сомнении — не кикаем (сервер падает на InfiniteShoot).
+local function isIntermission()
+    if not SoccerType or type(SoccerType.IsIntermission) ~= "function" then return false end
+    local ok, res = pcall(SoccerType.IsIntermission)
+    return ok and res == true
+end
+
 local function isPlaying()
-    if not SoccerType or type(SoccerType.IsPlaying) ~= "function" then return true end
+    if isIntermission() then return false end
+    if not SoccerType or type(SoccerType.IsPlaying) ~= "function" then return false end
     local ok, res = pcall(SoccerType.IsPlaying)
-    if not ok then return true end
-    return res ~= false
+    return ok and res == true
+end
+
+local function requestKickBalls()
+    if InvokeCustom then
+        pcall(InvokeCustom.InvokeServer, InvokeCustom, "SoccerEvent", "RequestAllBalls")
+    end
 end
 
 -- Перезапуск после hop/телепорта (Move Server не всегда триггерит queue_on_teleport)
@@ -696,6 +708,7 @@ local Kicker = {}
 do
     local failStreak = 0
     local lastFailLog = 0
+    local wasPaused = false
 
     local function kickAccuracy(cmd)
         if cmd == "Shoot" then
@@ -738,10 +751,19 @@ do
             if not inSoccer() then
                 ensureInSoccer()
                 task.wait(1.0)
-            elseif CONFIG.PAUSE_ON_INTERMISSION and not isPlaying() then
+            elseif not isPlaying() then
+                if not wasPaused then
+                    wasPaused = true
+                    print("[SoccerAuto] Intermission — кик на паузе.")
+                end
                 failStreak = 0
                 task.wait(1.0)
             else
+                if wasPaused then
+                    wasPaused = false
+                    requestKickBalls()
+                    task.wait(0.45)
+                end
                 if not InvokeCustom then
                     task.wait(1.0)
                 else
@@ -755,8 +777,9 @@ do
                     ZoneProgress.tick()
                 end
                 local cmd = ZoneProgress.getKickCommand()
+                requestKickBalls()
                 if cmd == "Shoot" then
-                    ZoneProgress.requestBalls()
+                    task.wait(0.08)
                 end
                 local ok, res = pcall(InvokeCustom.InvokeServer, InvokeCustom,
                     "SoccerEvent", cmd, kickAccuracy(cmd))
@@ -1846,7 +1869,7 @@ end
 ----------------------------------------------------------------
 -- ЗАПУСК
 ----------------------------------------------------------------
-print(("[SoccerAuto] v5.17 старт | executor=%s"):format(tostring(U.identify())))
+print(("[SoccerAuto] v5.18 старт | executor=%s"):format(tostring(U.identify())))
 
 ensureInSoccer()
 if CONFIG.AUTO_EQUIP_PETS then
