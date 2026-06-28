@@ -1,6 +1,6 @@
 --[[
     ================================================================
-       SOCCER EVENT AUTO  v5.14  —  Pet Sim 99 / Soccer Event
+       SOCCER EVENT AUTO  v5.15  —  Pet Sim 99 / Soccer Event
     ================================================================
     Полностью исследовано вживую через Roblox MCP (placeId 8737899170,
     executor Volt 1.2.24.3). Все механики подтверждены на реальной игре.
@@ -14,7 +14,7 @@
         (server-side, не конфликтует с киком). Стой на яйце — скрипт держит
         авто-хэтч включённым.
       • Умные апгрейды: тратит SoccerOrbs по приоритету (доход / 100% крит).
-      • Авто-экип лучших питомцев: топ из GetSortedPets (сила на карточке), не LD_BestFit.
+      • Авто-экип: PetCmds.EquipBest (LD_BestFit — как кнопка Equip Best в игре).
       • Анти-АФК: VirtualUser + Players.Idled (проверено).
       • Оптимизация игры (обратимая): FPS-cap, отключение пост-эффектов,
         понижение качества рендера.
@@ -40,7 +40,7 @@ local CONFIG = {
     AUTO_KICK    = true,   -- кастомный быстрый кик (InfiniteShoot)
     AUTO_HATCH   = true,   -- авто-открытие кастом-яйца (CustomEggs_Hatch)
     AUTO_UPGRADE = true,
-    AUTO_EQUIP_PETS = true,  -- топ-N из PetCmds.GetSortedPets (сила на карточке)
+    AUTO_EQUIP_PETS = true,  -- PetCmds.EquipBest (LD_BestFit)
     ANTI_AFK     = true,
     OPTIMIZE_GAME = true,  -- обратимая оптимизация графики
 
@@ -60,12 +60,11 @@ local CONFIG = {
     UPGRADE_INTERVAL = 2.0,
     ORB_RESERVE      = 0,
 
-    -- Экип питомцев (GetSortedPets = сортировка как в инвентаре по силе)
-    EQUIP_MODE = "sorted",       -- "sorted" = топ GetSortedPets; "bestfit" = EquipBest/LD_BestFit
-    EQUIP_BEST_INTERVAL = 30,    -- периодический пересчёт (сек)
-    EQUIP_BEST_COOLDOWN = 8,     -- мин. пауза между полными пере-экипами (сек)
-    EQUIP_ENSURE_AUTO   = true,  -- авто-экип игры для новых петов
-    EQUIP_DISABLE_FAVORITE = true, -- выключить режим «только избранные»
+    -- Экип: EquipBest / LD_BestFit (как кнопка Equip Best в инвентаре)
+    EQUIP_BEST_INTERVAL = 30,
+    EQUIP_BEST_COOLDOWN = 8,
+    EQUIP_ENSURE_AUTO   = true,
+    EQUIP_DISABLE_FAVORITE = true,
     PRIORITIZE_100_PERCENT = false, -- сперва Critical+Trickshot до 100%
     UPGRADE_PRIORITY = {
         "SoccerYeetOrbStrength", "SoccerYeetOrbsReach", "SoccerBetterYeetEgg",
@@ -1850,7 +1849,7 @@ end
 ----------------------------------------------------------------
 -- ЗАПУСК
 ----------------------------------------------------------------
-print(("[SoccerAuto] v5.14 старт | executor=%s"):format(tostring(U.identify())))
+print(("[SoccerAuto] v5.15 старт | executor=%s"):format(tostring(U.identify())))
 
 ensureInSoccer()
 if CONFIG.AUTO_EQUIP_PETS then
