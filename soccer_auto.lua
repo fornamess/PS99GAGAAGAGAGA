@@ -1,6 +1,6 @@
 --[[
     ================================================================
-       SOCCER EVENT AUTO  v5.18  —  Pet Sim 99 / Soccer Event
+       SOCCER EVENT AUTO  v5.19  —  Pet Sim 99 / Soccer Event
     ================================================================
     Полностью исследовано вживую через Roblox MCP (placeId 8737899170,
     executor Volt 1.2.24.3). Все механики подтверждены на реальной игре.
@@ -105,9 +105,10 @@ local CONFIG = {
     AUTO_ZONE_PROGRESS  = true,  -- авто-прогрессия зон 1→5 (Shoot + покупка зон)
     MAX_SOCCER_ZONE     = 5,
 
-    -- Кик: recovery при серверных ошибках (Move Server — hop внутри того же place)
-    KICK_FAIL_HOP       = false, -- true = hop после серии fail; по умолчанию выкл (ложные fail у яйца)
-    KICK_FAIL_HOP_AFTER = 8,     -- сколько fail подряд (только если KICK_FAIL_HOP = true)
+    -- Кик: recovery при сломанном инстансе (ServerModule nil — Leave+Enter, потом hop)
+    KICK_INSTANCE_REJOIN_AFTER = 4, -- перезаход в SoccerEvent после N ServerModule-ошибок
+    KICK_FAIL_HOP       = true,  -- hop если после rejoin всё ещё fail
+    KICK_FAIL_HOP_AFTER = 12,
 
     -- Доп. клеймы / бусты (проверено через MCP)
     AUTO_FREE_GIFTS    = true,  -- Redeem Free Gift 1..12 по Save.FreeGiftsRedeemed
@@ -253,16 +254,19 @@ end
 ----------------------------------------------------------------
 -- ссылки на игру
 ----------------------------------------------------------------
-local Library = ReplicatedStorage:WaitForChild("Library", 10)
-local Network = ReplicatedStorage:WaitForChild("Network", 10)
+repeat task.wait() until game:IsLoaded()
+ReplicatedStorage:WaitForChild("Network", 120)
+
+local Library = ReplicatedStorage:WaitForChild("Library", 30)
+local Network = ReplicatedStorage:WaitForChild("Network", 30)
 if not Library or not Network then
     warn("[SoccerAuto] Не найден Library/Network — не та игра?")
     return
 end
 
-local FireCustom   = Network:WaitForChild("Instancing_FireCustomFromClient", 10)
-local InvokeCustom = Network:WaitForChild("Instancing_InvokeCustomFromClient", 10)
-local CustomEggsHatch = Network:WaitForChild("CustomEggs_Hatch", 10)
+local FireCustom   = Network:WaitForChild("Instancing_FireCustomFromClient", 30)
+local InvokeCustom = Network:WaitForChild("Instancing_InvokeCustomFromClient", 30)
+local CustomEggsHatch = Network:WaitForChild("CustomEggs_Hatch", 30)
 local AutoHatchEnable = Network:FindFirstChild("AutoHatch_Enable")
 if not InvokeCustom then
     warn("[SoccerAuto] Instancing_InvokeCustomFromClient не найден — кик отключён.")
@@ -338,21 +342,29 @@ local function buildQueueLoader()
     local path = CONFIG.SCRIPT_PATH or "soccer_auto.lua"
     if type(readfile) == "function" and type(isfile) == "function" and isfile(path) then
         return ([=[
+pcall(function()
 repeat task.wait() until game:IsLoaded()
-game:GetService("ReplicatedStorage"):WaitForChild("Network", 120)
+local rs = game:GetService("ReplicatedStorage")
+if not rs then return end
+rs:WaitForChild("Network", 120)
 local function loadLocal(p)
     if isfile and isfile(p) then loadstring(readfile(p), p)() end
 end
 loadLocal("bootstrap.lua")
 loadLocal("%s")
+end)
 ]=]):format(path:gsub("\\", "\\\\"))
     end
     if base ~= "" then
         return ([=[
+pcall(function()
 repeat task.wait() until game:IsLoaded()
-game:GetService("ReplicatedStorage"):WaitForChild("Network", 120)
+local rs = game:GetService("ReplicatedStorage")
+if not rs then return end
+rs:WaitForChild("Network", 120)
 loadstring(game:HttpGet("%s/bootstrap.lua"), "bootstrap")()
 loadstring(game:HttpGet("%s/soccer_auto.lua"), "soccer_auto")()
+end)
 ]=]):format(base, base)
     end
     return nil
@@ -407,11 +419,37 @@ local function ensureInSoccer()
     if ok then
         print("[SoccerAuto] Авто-вход в SoccerEvent.")
         task.defer(function()
-            if InvokeCustom then
-                pcall(InvokeCustom.InvokeServer, InvokeCustom, "SoccerEvent", "RequestAllBalls")
-            end
+            task.wait(2)
+            requestKickBalls()
         end)
     end
+end
+
+local lastInstanceRejoin = 0
+local function rejoinSoccerInstance()
+    if not InstancingCmds then return false end
+    local now = os.clock()
+    if (now - lastInstanceRejoin) < 25 then return false end
+    lastInstanceRejoin = now
+    print("[SoccerAuto] Перезаход в SoccerEvent (сломанный серверный инстанс)…")
+    pcall(InstancingCmds.Leave)
+    task.wait(2.5)
+    local ok = pcall(InstancingCmds.Enter, "SoccerEvent")
+    task.wait(3)
+    requestKickBalls()
+    if ok and inSoccer() then
+        print("[SoccerAuto] SoccerEvent перезаход OK.")
+        return true
+    end
+    warn("[SoccerAuto] Перезаход в SoccerEvent не удался.")
+    return false
+end
+
+local function isBrokenServerKick(ok, res)
+    if ok then return false end
+    local s = tostring(res)
+    return s:find("ServerModule", 1, true) ~= nil
+        or s:find("INSTANCE_UNREPLICATED", 1, true) ~= nil
 end
 
 ----------------------------------------------------------------
@@ -719,11 +757,11 @@ do
 
     local function isKickSuccess(res, cmd)
         if type(res) ~= "table" then return false end
+        if res.Success == true then return true end
         if cmd == "Shoot" then
-            if res.Success == true then return true end
             return type(res.Coins) == "number" and res.Coins > 0
         end
-        return true
+        return type(res.Coins) == "number" and res.Coins > 0
     end
 
     local function disableGameAutoKick()
@@ -783,7 +821,10 @@ do
                 end
                 local ok, res = pcall(InvokeCustom.InvokeServer, InvokeCustom,
                     "SoccerEvent", cmd, kickAccuracy(cmd))
-                if ok and isKickSuccess(res, cmd) then
+                if ok and res == nil then
+                    -- серверный cooldown (guard ~3с), не считаем fail
+                    task.wait(CONFIG.KICK_RATE)
+                elseif ok and isKickSuccess(res, cmd) then
                     failStreak = 0
                     Runtime.stats.kicks += 1
                     if gatePhase then
@@ -798,6 +839,12 @@ do
                         local resInfo = type(res) == "table" and "table" or tostring(res)
                         print(("[SoccerAuto] Кик отклонён (%s): ok=%s res=%s | streak=%d")
                             :format(cmd, tostring(ok), resInfo, failStreak))
+                    end
+                    local rejoinAfter = CONFIG.KICK_INSTANCE_REJOIN_AFTER or 4
+                    if isBrokenServerKick(ok, res) and failStreak >= rejoinAfter then
+                        if rejoinSoccerInstance() then
+                            failStreak = 0
+                        end
                     end
                     local hopAfter = CONFIG.KICK_FAIL_HOP_AFTER or 0
                     if CONFIG.KICK_FAIL_HOP and hopAfter > 0 and failStreak >= hopAfter then
@@ -1869,7 +1916,7 @@ end
 ----------------------------------------------------------------
 -- ЗАПУСК
 ----------------------------------------------------------------
-print(("[SoccerAuto] v5.18 старт | executor=%s"):format(tostring(U.identify())))
+print(("[SoccerAuto] v5.19 старт | executor=%s"):format(tostring(U.identify())))
 
 ensureInSoccer()
 if CONFIG.AUTO_EQUIP_PETS then

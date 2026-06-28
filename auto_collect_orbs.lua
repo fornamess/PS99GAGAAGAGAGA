@@ -7,8 +7,14 @@ local FIND_RETRY     = 1.0    -- как часто пытаться найти �
 local DESTROY_MODEL  = true   -- удалять модель орба после сбора (визуально пропадает)
 -- =====================
 
-local Network = ReplicatedStorage:WaitForChild("Network")
-local FireCustom = Network:WaitForChild("Instancing_FireCustomFromClient")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+repeat task.wait() until game:IsLoaded()
+local Network = ReplicatedStorage:WaitForChild("Network", 120)
+if not Network then
+    warn("[Orbs] Network не найден")
+    return
+end
+local FireCustom = Network:WaitForChild("Instancing_FireCustomFromClient", 30)
 
 getgenv = getgenv or function() return _G end
 local ENV = getgenv()
