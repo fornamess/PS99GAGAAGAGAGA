@@ -1,6 +1,6 @@
 --[[
     ================================================================
-       SOCCER EVENT AUTO  v4  —  Pet Sim 99 / Soccer Event
+       SOCCER EVENT AUTO  v5  —  Pet Sim 99 / Soccer Event
     ================================================================
     Полностью исследовано вживую через Roblox MCP (placeId 8737899170,
     executor Volt 1.2.24.3). Все механики подтверждены на реальной игре.
@@ -48,7 +48,8 @@ local CONFIG = {
     KICK_BACKOFF  = 0.6,   -- пауза, если кик отклонён сервером
 
     -- Орбы
-    CLAIM_INTERVAL = 0.15, -- частота прохода по реестру (сек)
+    CLAIM_INTERVAL      = 0.15, -- быстрый проход, когда орбы есть
+    CLAIM_INTERVAL_IDLE = 0.65, -- медленный проход, когда реестр пуст
     DESTROY_MODEL  = true, -- убирать модель орба после сбора
 
     -- Апгрейды
@@ -79,12 +80,15 @@ local CONFIG = {
     -- Апгрейды: "priority" | "smart" (самый дешёвый из приоритетных) | "cheapest" (глобально дешёвый)
     UPGRADE_MODE = "smart",
 
-    -- Авто-вход / питомцы
-    AUTO_ENTER        = true,  -- InstancingCmds.Enter("SoccerEvent") если не в ивенте
-    AUTO_EQUIP_BEST   = true,  -- Pets_EquipBest при старте
+    -- Авто-вход / телепорты
+    AUTO_ENTER          = true,  -- InstancingCmds.Enter("SoccerEvent")
+    AUTO_TELEPORT_EGG   = true,  -- телепорт к лучшему яйцу (кик без телепорта)
+    TELEPORT_EGG_DIST   = 12,    -- телепорт, если дальше N studs от будки
+    AUTO_ZONE_PROGRESS  = true,  -- авто-прогрессия зон 1→5 (Shoot + покупка зон)
+    MAX_SOCCER_ZONE     = 5,
 
     -- Кик: recovery при серверных ошибках
-    KICK_FAIL_REJOIN_AFTER = 8, -- после N подряд fail — Leave+Enter (проверено через MCP)
+    KICK_FAIL_HOP_AFTER = 8,     -- после N fail — Move Server (hop)
 
     -- Доп. клеймы / бусты (проверено через MCP)
     AUTO_FREE_GIFTS    = true,  -- Redeem Free Gift 1..12 по Save.FreeGiftsRedeemed
@@ -97,6 +101,13 @@ local CONFIG = {
     FPS_CAP            = 60,    -- 0 = не трогать
     DISABLE_POSTFX     = true,  -- выключить Bloom/Blur/DOF/SunRays
     LOWER_QUALITY      = true,  -- понизить уровень качества рендера
+    POTATO_MODE        = true,  -- PlayerGraphicsSetting_Set PotatoMode (игровой режим)
+    STRIP_SOCCER_VFX   = true,  -- particles/shadows в SoccerEvent (~74 эмиттера)
+    EGG_POTATO_MODE    = true,  -- меньше частиц при хэтче (EggPotatoMode)
+    STRIP_VFX_INTERVAL = 45,    -- повторная чистка VFX (сек)
+
+    -- Intermission: ускоренные клеймы/апгрейды между раундами
+    INTERMISSION_BURST = true,
 
     -- Пауза кика на Intermission (сервер всё равно отклоняет кики в паузе)
     PAUSE_ON_INTERMISSION = true,
@@ -229,6 +240,7 @@ local AutoHatchEnable = Network:FindFirstChild("AutoHatch_Enable")
 
 local Client = Library:WaitForChild("Client", 10)
 local InstancingCmds   = safeRequire(Client:FindFirstChild("InstancingCmds"))
+local InstanceZoneCmds = safeRequire(Client:FindFirstChild("InstanceZoneCmds"))
 local EventUpgradeCmds = safeRequire(Client:FindFirstChild("EventUpgradeCmds"))
 local CurrencyCmds     = safeRequire(Client:FindFirstChild("CurrencyCmds"))
 local Hatching         = safeRequire(Client:FindFirstChild("HatchingCmds"))
@@ -245,7 +257,9 @@ local Rf_LoginClaim = Network:FindFirstChild("Login Streaks: Claim")
 local Rf_MailboxAll = Network:FindFirstChild("Mailbox: Claim All")
 local Rf_FreeGift   = Network:FindFirstChild("Redeem Free Gift")
 local Rf_ForeverFree = Network:FindFirstChild("ForeverPacks: Claim Free")
-local Ev_EquipBest  = Network:FindFirstChild("Pets_EquipBest")
+local Rf_ZonePurchase = Network:FindFirstChild("InstanceZones_RequestPurchase")
+local Ev_MoveServer  = Network:FindFirstChild("Move Server")
+local Ev_GraphicsSet = Network:FindFirstChild("PlayerGraphicsSetting_Set")
 
 local UpgradeDefsFolder
 do
@@ -282,9 +296,127 @@ local function ensureInSoccer()
     if ok then print("[SoccerAuto] Авто-вход в SoccerEvent.") end
 end
 
-local function equipBestPets()
-    if not CONFIG.AUTO_EQUIP_BEST or not Ev_EquipBest then return end
-    pcall(Ev_EquipBest.FireServer, Ev_EquipBest)
+----------------------------------------------------------------
+-- телепорт / инстанс
+----------------------------------------------------------------
+local function getSoccerInstance()
+    local things = workspace:FindFirstChild("__THINGS")
+    local cont = things and things:FindFirstChild("__INSTANCE_CONTAINER")
+    local active = cont and cont:FindFirstChild("Active")
+    return active and active:FindFirstChild("SoccerEvent")
+end
+
+local function getHRP()
+    local char = LocalPlayer.Character
+    return char and char:FindFirstChild("HumanoidRootPart")
+end
+
+local function teleportTo(pos)
+    local hrp = getHRP()
+    if not hrp or typeof(pos) ~= "Vector3" then return false end
+    pcall(function() hrp.CFrame = CFrame.new(pos) end)
+    return true
+end
+
+local function teleportToPart(part)
+    if not part or not part:IsA("BasePart") then return false end
+    return teleportTo(part.Position + Vector3.new(0, 3, 0))
+end
+
+----------------------------------------------------------------
+-- авто-прогрессия зон (ворота → Shoot → монеты → покупка зоны)
+----------------------------------------------------------------
+local ZoneProgress = {}
+do
+    local function maxZone()
+        return CONFIG.MAX_SOCCER_ZONE or 5
+    end
+
+    function ZoneProgress.isComplete()
+        if not CONFIG.AUTO_ZONE_PROGRESS or not InstanceZoneCmds then return true end
+        local mz = maxZone()
+        local ok, unlocked = pcall(InstanceZoneCmds.IsUnlocked, mz)
+        if ok and unlocked == true then return true end
+        local ok2, owned = pcall(InstanceZoneCmds.GetMaximumOwnedZoneNumber)
+        return ok2 and type(owned) == "number" and owned >= mz
+    end
+
+    function ZoneProgress.getKickCommand()
+        return ZoneProgress.isComplete() and "InfiniteShoot" or "Shoot"
+    end
+
+    local function findAreaFolder(zoneNum)
+        local inst = getSoccerInstance()
+        if not inst then return nil end
+        for _, ch in ipairs(inst:GetChildren()) do
+            if ch.Name:find("Area " .. zoneNum) then return ch end
+        end
+        return inst:FindFirstChild("Common")
+            or inst:FindFirstChild("1 | Area 1")
+    end
+
+    function ZoneProgress.teleportToZone(zoneNum)
+        local inst = getSoccerInstance()
+        if not inst then return false end
+        local teleports = inst:FindFirstChild("Teleports")
+        if teleports then
+            local names = {
+                tostring(zoneNum),
+                "Zone" .. zoneNum,
+                "Zone " .. zoneNum,
+                "Area" .. zoneNum,
+            }
+            for _, n in ipairs(names) do
+                local t = teleports:FindFirstChild(n)
+                if t then
+                    local p = t:IsA("BasePart") and t or t:FindFirstChildWhichIsA("BasePart", true)
+                    if p and teleportToPart(p) then return true end
+                end
+            end
+        end
+        local area = findAreaFolder(zoneNum)
+        if area then
+            local p = area:FindFirstChild("Center", true)
+                or area:FindFirstChild("MainHoop", true)
+                or area:FindFirstChild("ThrowZone", true)
+                or area:FindFirstChildWhichIsA("BasePart", true)
+            if p and teleportToPart(p) then return true end
+        end
+        local gates = inst:FindFirstChild("Gates")
+        if gates then
+            local p = gates:FindFirstChildWhichIsA("BasePart", true)
+            if p and teleportToPart(p) then return true end
+        end
+        return false
+    end
+
+    function ZoneProgress.tryPurchaseNext()
+        if not InstanceZoneCmds or not Rf_ZonePurchase then return false end
+        local owned = 0
+        local okO, n = pcall(InstanceZoneCmds.GetMaximumOwnedZoneNumber)
+        if okO and type(n) == "number" then owned = n end
+        local nextZone = owned + 1
+        if nextZone > maxZone() then return false end
+        local okU, unlocked = pcall(InstanceZoneCmds.IsUnlocked, nextZone)
+        if okU and unlocked == true then return false end
+        local ok, res = pcall(Rf_ZonePurchase.InvokeServer, Rf_ZonePurchase, "SoccerEvent", nextZone)
+        if ok and res == true then
+            print(("[SoccerAuto] Зона %d куплена."):format(nextZone))
+            return true
+        end
+        return false
+    end
+
+    function ZoneProgress.tick()
+        if ZoneProgress.isComplete() or not InstanceZoneCmds then return end
+        local target = maxZone()
+        local ok, owned = pcall(InstanceZoneCmds.GetMaximumOwnedZoneNumber)
+        if ok and type(owned) == "number" then
+            target = math.min(owned + 1, maxZone())
+        end
+        ZoneProgress.tryPurchaseNext()
+        ZoneProgress.teleportToZone(target)
+    end
 end
 
 ----------------------------------------------------------------
@@ -339,16 +471,37 @@ do
 
     OrbCollector.isOrbEntry = isOrbEntry
 
+    function OrbCollector.reset()
+        accFn, accIdx = nil, nil
+    end
+
+    function OrbCollector.setupListeners()
+        if not InstancingCmds then return end
+        if type(InstancingCmds.AddLeaveListener) == "function" then
+            track(InstancingCmds.AddLeaveListener(function()
+                OrbCollector.reset()
+            end))
+        end
+        if type(InstancingCmds.AddEnterListener) == "function" then
+            track(InstancingCmds.AddEnterListener(function(id)
+                if id == "SoccerEvent" then
+                    OrbCollector.reset()
+                    findAccessor()
+                end
+            end))
+        end
+    end
+
     function OrbCollector.tick()
         local reg = getRegistry()
         if not reg then
             findAccessor()
-            return
+            return 0
         end
+        local n = 0
         for key, orb in pairs(reg) do
             if isOrbEntry(orb) then
                 local uid = rawget(orb, "UID")
-                -- closure-free вызов (без аллокаций в горячем пути)
                 pcall(FireCustom.FireServer, FireCustom, "SoccerEvent", "ClaimOrb", uid)
                 if CONFIG.DESTROY_MODEL then
                     local model = rawget(orb, "Model")
@@ -358,8 +511,10 @@ do
                 end
                 rawset(reg, key, nil)
                 Runtime.stats.orbs += 1
+                n += 1
             end
         end
+        return n
     end
 end
 
@@ -395,20 +550,27 @@ do
                 task.wait(1.0)
             else
                 disableGameAutoKick()
+                if not ZoneProgress.isComplete() then
+                    ZoneProgress.tick()
+                end
+                local cmd = ZoneProgress.getKickCommand()
                 local ok, res = pcall(InvokeCustom.InvokeServer, InvokeCustom,
-                    "SoccerEvent", "InfiniteShoot", acc)
+                    "SoccerEvent", cmd, acc)
                 if ok and type(res) == "table" then
                     failStreak = 0
                     Runtime.stats.kicks += 1
+                    if not ZoneProgress.isComplete() then
+                        ZoneProgress.tryPurchaseNext()
+                    end
                     task.wait(CONFIG.KICK_RATE)
                 else
                     failStreak += 1
-                    if failStreak >= (CONFIG.KICK_FAIL_REJOIN_AFTER or 8) and InstancingCmds then
+                    if failStreak >= (CONFIG.KICK_FAIL_HOP_AFTER or 8) and Ev_MoveServer then
                         failStreak = 0
-                        pcall(InstancingCmds.Leave)
-                        task.wait(1.0)
-                        pcall(InstancingCmds.Enter, "SoccerEvent")
-                        task.wait(2.0)
+                        print("[SoccerAuto] Кик fail — hop на другой сервер...")
+                        pcall(Ev_MoveServer.FireServer, Ev_MoveServer)
+                        task.wait(5.0)
+                        ensureInSoccer()
                     end
                     task.wait(CONFIG.KICK_BACKOFF)
                 end
@@ -424,13 +586,8 @@ end
 ----------------------------------------------------------------
 local EggHatcher = {}
 do
-    -- кеш по UID будки: { count, setupDone }
     local cache = {}
-
-    local function getHRP()
-        local char = LocalPlayer.Character
-        return char and char:FindFirstChild("HumanoidRootPart")
-    end
+    local eggPotatoOn = false
 
     local function eggTier(info)
         if not info or not info._id then return 0 end
@@ -440,22 +597,30 @@ do
             or 0
     end
 
-    -- Лучшая или ближайшая будка в радиусе.
-    local function findTargetBooth()
-        local uid = CONFIG.HATCH_BOOTH_UID
-        if uid then return uid end
+    local function getEggInfo(uid)
+        if not CustomEggsCmds then return nil end
+        local ok, info = pcall(CustomEggsCmds.Get, uid)
+        if ok and type(info) == "table" then return info end
+        return nil
+    end
 
-        local hrp = getHRP()
-        if not hrp then return nil end
+    -- Лучшая будка (глобально или в радиусе).
+    local function findBestBooth()
+        if CONFIG.HATCH_BOOTH_UID then
+            return CONFIG.HATCH_BOOTH_UID, nil
+        end
         local folder = workspace:FindFirstChild("__THINGS")
         folder = folder and folder:FindFirstChild("CustomEggs")
         if not folder then return nil end
 
-        local bestUID, bestScore, bestDist
+        local hrp = getHRP()
+        local bestUID, bestScore, bestDist, bestCenter
         for _, booth in ipairs(folder:GetChildren()) do
-            if booth:FindFirstChild("Egg") and booth:FindFirstChild("Center") then
-                local dist = (booth.Center.Position - hrp.Position).Magnitude
-                if dist <= CONFIG.HATCH_RANGE then
+            local center = booth:FindFirstChild("Center")
+            if booth:FindFirstChild("Egg") and center then
+                local dist = hrp and (center.Position - hrp.Position).Magnitude or 0
+                local inRange = CONFIG.AUTO_TELEPORT_EGG or dist <= CONFIG.HATCH_RANGE
+                if inRange then
                     local info = getEggInfo(booth.Name)
                     local tier = eggTier(info)
                     local pick
@@ -466,21 +631,31 @@ do
                         pick = not bestDist or dist < bestDist
                     end
                     if pick then
-                        bestUID, bestScore, bestDist = booth.Name, tier, dist
+                        bestUID = booth.Name
+                        bestScore = tier
+                        bestDist = dist
+                        bestCenter = center
                     end
                 end
             end
         end
-        return bestUID
+        return bestUID, bestCenter
     end
 
-    -- Надёжно получаем данные яйца по UID через CustomEggsCmds.Get
-    -- (НЕ читаем Title GUI — он ненадёжен и отличается между яйцами/серверами).
-    local function getEggInfo(uid)
-        if not CustomEggsCmds then return nil end
-        local ok, info = pcall(CustomEggsCmds.Get, uid)
-        if ok and type(info) == "table" then return info end
-        return nil
+    local function teleportToBestEgg(uid, center)
+        if not CONFIG.AUTO_TELEPORT_EGG then return end
+        local hrp = getHRP()
+        if not hrp or not center then return end
+        local dist = (center.Position - hrp.Position).Magnitude
+        if dist <= (CONFIG.TELEPORT_EGG_DIST or 12) then return end
+        teleportToPart(center)
+    end
+
+    local function setEggPotatoMode(on)
+        if not CONFIG.EGG_POTATO_MODE or not Ev_GraphicsSet then return end
+        if eggPotatoOn == on then return end
+        eggPotatoOn = on
+        pcall(Ev_GraphicsSet.FireServer, Ev_GraphicsSet, "EggPotatoMode", on)
     end
 
     -- Определяем count (max hatch). Best-effort, с запасным значением.
@@ -534,8 +709,11 @@ do
     local function hatchOnce()
         if not CustomEggsHatch then return false end
 
-        local uid = findTargetBooth()
+        local uid, center = findBestBooth()
         if not uid then return false end
+
+        teleportToBestEgg(uid, center)
+        setEggPotatoMode(true)
 
         local info = getEggInfo(uid)
         -- даже если info=nil (не успело прогрузиться) — всё равно пробуем хэтч,
@@ -844,6 +1022,37 @@ end
 ----------------------------------------------------------------
 -- 6) ОПТИМИЗАЦИЯ ИГРЫ  (обратимая)
 ----------------------------------------------------------------
+local function stripSoccerVfx()
+    if not CONFIG.STRIP_SOCCER_VFX then return end
+    local inst = getSoccerInstance()
+    if not inst then return end
+    Runtime.restore.soccerVfx = Runtime.restore.soccerVfx or {}
+    local seen = {}
+    for _, e in ipairs(Runtime.restore.soccerVfx) do seen[e] = true end
+    for _, d in ipairs(inst:GetDescendants()) do
+        if d:IsA("ParticleEmitter") and d.Enabled then
+            if not seen[d] then
+                Runtime.restore.soccerVfx[#Runtime.restore.soccerVfx + 1] = d
+                seen[d] = true
+            end
+            pcall(function() d.Enabled = false end)
+        elseif d:IsA("BasePart") and d.CastShadow then
+            if not seen[d] then
+                Runtime.restore.soccerVfx[#Runtime.restore.soccerVfx + 1] = d
+                seen[d] = true
+            end
+            pcall(function() d.CastShadow = false end)
+        end
+    end
+end
+
+local function applyPotatoMode()
+    if not CONFIG.POTATO_MODE or not Ev_GraphicsSet then return end
+    pcall(Ev_GraphicsSet.FireServer, Ev_GraphicsSet, "PotatoMode", true)
+    pcall(Ev_GraphicsSet.FireServer, Ev_GraphicsSet, "Particles", false)
+    pcall(Ev_GraphicsSet.FireServer, Ev_GraphicsSet, "Shadows", false)
+end
+
 local function applyOptimization()
     -- FPS cap
     if CONFIG.FPS_CAP and CONFIG.FPS_CAP > 0 and type(U.setfpscap) == "function" then
@@ -868,6 +1077,8 @@ local function applyOptimization()
             r.QualityLevel = Enum.QualityLevel.Level01
         end)
     end
+    applyPotatoMode()
+    stripSoccerVfx()
     print("[SoccerAuto] Оптимизация применена.")
 end
 
@@ -880,8 +1091,34 @@ local function restoreOptimization()
             pcall(function() e.Enabled = true end)
         end
     end
+    if Runtime.restore.soccerVfx then
+        for _, e in ipairs(Runtime.restore.soccerVfx) do
+            pcall(function()
+                if e:IsA("ParticleEmitter") then e.Enabled = true
+                elseif e:IsA("BasePart") then e.CastShadow = true end
+            end)
+        end
+    end
     if Runtime.restore.quality ~= nil then
         pcall(function() settings().Rendering.QualityLevel = Runtime.restore.quality end)
+    end
+end
+
+local function setupMaintenanceLoops()
+    if CONFIG.STRIP_SOCCER_VFX then
+        spawnLoop("vfx", function()
+            if inSoccer() then safe("vfx", stripSoccerVfx) end
+            task.wait(CONFIG.STRIP_VFX_INTERVAL or 45)
+        end)
+    end
+    if CONFIG.INTERMISSION_BURST then
+        spawnLoop("intermission", function()
+            if inSoccer() and not isPlaying() then
+                safe("claims", claimsTick)
+                safe("upgrade", Upgrades.tick)
+            end
+            task.wait(2.0)
+        end)
     end
 end
 
@@ -909,23 +1146,38 @@ function App.Status()
                 save.SoccerHuge2Credits or 0, save.SoccerTitanicCredits or 0,
                 save.SoccerGargCredits or 0)
     end
-    print(("[SoccerAuto] kicks=%d orbs=%d hatches=%d upgrades=%d claims=%d errors=%d running=%s playing=%s%s")
+    local zoneInfo = ""
+    if InstanceZoneCmds then
+        local ok, z = pcall(InstanceZoneCmds.GetMaximumOwnedZoneNumber)
+        zoneInfo = (" | zone=%s/%d"):format(ok and tostring(z) or "?", CONFIG.MAX_SOCCER_ZONE or 5)
+    end
+    print(("[SoccerAuto] kicks=%d orbs=%d hatches=%d upgrades=%d claims=%d errors=%d running=%s playing=%s%s%s")
         :format(s.kicks, s.orbs, s.hatches, s.upgrades, s.claims, s.errors,
-            tostring(Runtime.running), tostring(isPlaying()), credits))
+            tostring(Runtime.running), tostring(isPlaying()), credits, zoneInfo))
     return s
 end
 
 ----------------------------------------------------------------
 -- ЗАПУСК
 ----------------------------------------------------------------
-print(("[SoccerAuto] v4 старт | executor=%s"):format(tostring(U.identify())))
+print(("[SoccerAuto] v5 старт | executor=%s"):format(tostring(U.identify())))
 
 ensureInSoccer()
-equipBestPets()
+if CONFIG.COLLECT_ORBS then safe("orbListeners", OrbCollector.setupListeners) end
+if CONFIG.AUTO_ZONE_PROGRESS then
+    task.spawn(function()
+        task.wait(2)
+        if Runtime.running and inSoccer() and not ZoneProgress.isComplete() then
+            safe("zoneBoot", ZoneProgress.tick)
+            print("[SoccerAuto] Авто-прогрессия зон: Shoot + покупка зон.")
+        end
+    end)
+end
 
 if CONFIG.OPTIMIZE_GAME then safe("optimize", applyOptimization) end
 if CONFIG.ANTI_AFK then safe("antiafk", setupAntiAFK) end
 if CONFIG.AUTO_REJOIN or CONFIG.QUEUE_ON_TELEPORT then safe("autorejoin", setupAutoRejoin) end
+safe("maint", setupMaintenanceLoops)
 
 -- Поток авто-клеймов (низкая частота)
 if CONFIG.AUTO_CLAIM then
@@ -938,8 +1190,10 @@ end
 -- Поток сбора орбов (высокая частота, не должен блокироваться)
 if CONFIG.COLLECT_ORBS then
     spawnLoop("orbs", function()
-        safe("orbs", OrbCollector.tick)
-        task.wait(CONFIG.CLAIM_INTERVAL)
+        local n = 0
+        local ok, count = pcall(OrbCollector.tick)
+        if ok and type(count) == "number" then n = count end
+        task.wait(n > 0 and CONFIG.CLAIM_INTERVAL or (CONFIG.CLAIM_INTERVAL_IDLE or 0.65))
     end)
 end
 
@@ -961,8 +1215,8 @@ if CONFIG.AUTO_UPGRADE then
     end)
 end
 
-print(("[SoccerAuto] Готов | Орбы:%s Кик:%s Хэтч:%s Апгр:%s Клейм:%s Вход:%s Питомцы:%s АнтиАФК:%s Реджойн:%s")
+print(("[SoccerAuto] Готов | Орбы:%s Кик:%s Хэтч:%s Апгр:%s Клейм:%s Вход:%s Зоны:%s Телепорт:%s АнтиАФК:%s")
     :format(tostring(CONFIG.COLLECT_ORBS), tostring(CONFIG.AUTO_KICK), tostring(CONFIG.AUTO_HATCH),
         tostring(CONFIG.AUTO_UPGRADE), tostring(CONFIG.AUTO_CLAIM), tostring(CONFIG.AUTO_ENTER),
-        tostring(CONFIG.AUTO_EQUIP_BEST), tostring(CONFIG.ANTI_AFK), tostring(CONFIG.AUTO_REJOIN)))
+        tostring(CONFIG.AUTO_ZONE_PROGRESS), tostring(CONFIG.AUTO_TELEPORT_EGG), tostring(CONFIG.ANTI_AFK)))
 print("[SoccerAuto] Стоп: getgenv().__SoccerAuto.Stop()  |  Статус: getgenv().__SoccerAuto.Status()")
