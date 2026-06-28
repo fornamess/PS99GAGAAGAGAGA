@@ -1,6 +1,6 @@
 --[[
     ================================================================
-       SOCCER EVENT AUTO  v5.12  —  Pet Sim 99 / Soccer Event
+       SOCCER EVENT AUTO  v5.12.1  —  Pet Sim 99 / Soccer Event
     ================================================================
     Полностью исследовано вживую через Roblox MCP (placeId 8737899170,
     executor Volt 1.2.24.3). Все механики подтверждены на реальной игре.
@@ -214,8 +214,8 @@ local function track(conn) Runtime.connections[#Runtime.connections + 1] = conn 
 
 -- rate-limited обработчик ошибок (без спама в консоль)
 local _errLog = {}
-local function safe(tag, fn, ...)
-    local ok, err = pcall(fn, ...)
+local function safe(tag, fn)
+    local ok, err = pcall(fn)
     if not ok then
         Runtime.stats.errors += 1
         local now = os.clock()
@@ -681,7 +681,7 @@ do
                     failStreak += 1
                     if failStreak >= (CONFIG.KICK_FAIL_HOP_AFTER or 8) and Ev_MoveServer then
                         failStreak = 0
-                        print("[SoccerAuto] Кик fail — hop на другой сервер...")
+                        print("[SoccerAuto] Кик fail — hop на другой сервер…")
                         pcall(Ev_MoveServer.FireServer, Ev_MoveServer)
                         task.wait(5.0)
                         ensureInSoccer()
@@ -830,7 +830,7 @@ do
         if wantMinScore > 0 and bestScore > 0 and bestScore < wantMinScore then
             if not Runtime._eggWaitLogged then
                 Runtime._eggWaitLogged = true
-                print("[SoccerAuto] Жду Egg 5 Tier 3+ (streaming)...")
+                print("[SoccerAuto] Жду Egg 5 Tier 3+ (streaming)…")
             end
             return nil
         end
@@ -892,7 +892,7 @@ do
         Runtime._lastEggZoneTp = now
         if not Runtime._eggZoneTpLogged then
             Runtime._eggZoneTpLogged = true
-            print(("[SoccerAuto] Телепорт к Area %d (прогрузка CustomEggs)..."):format(target))
+            print(("[SoccerAuto] Телепорт к Area %d (прогрузка CustomEggs)…"):format(target))
         end
 
         local hrp = getHRP()
@@ -1670,7 +1670,7 @@ end
 ----------------------------------------------------------------
 -- ЗАПУСК
 ----------------------------------------------------------------
-print(("[SoccerAuto] v5.12 старт | executor=%s"):format(tostring(U.identify())))
+print(("[SoccerAuto] v5.12.1 старт | executor=%s"):format(tostring(U.identify())))
 
 ensureInSoccer()
 if CONFIG.COLLECT_ORBS then safe("orbListeners", OrbCollector.setupListeners) end
