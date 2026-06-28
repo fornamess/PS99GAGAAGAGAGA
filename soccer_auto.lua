@@ -1,6 +1,6 @@
 --[[
     ================================================================
-       SOCCER EVENT AUTO  v3  —  Pet Sim 99 / Soccer Event
+       SOCCER EVENT AUTO  v4  —  Pet Sim 99 / Soccer Event
     ================================================================
     Полностью исследовано вживую через Roblox MCP (placeId 8737899170,
     executor Volt 1.2.24.3). Все механики подтверждены на реальной игре.
@@ -68,12 +68,30 @@ local CONFIG = {
     -- Анимация "Click to open!" обходится: шлём CustomEggs_Hatch напрямую без
     -- AttemptHatch (это и есть анимация). Темп держит сам сервер (debounce ~1.6с).
     HATCH_RANGE       = 25,    -- радиус поиска будки (studs)
-    HATCH_BOOTH_UID   = nil,   -- nil = авто ближайшая будка; или GUID вручную
-    HATCH_EGG_ID      = nil,   -- nil = взять название с будки (Title); или "Soccer Egg 5 Tier 3"
+    HATCH_BEST_EGG    = true,  -- true = лучший tier в радиусе; false = ближайшая будка
+    HATCH_BOOTH_UID   = nil,   -- nil = авто; или GUID вручную
+    HATCH_EGG_ID      = nil,   -- nil = авто через CustomEggsCmds.Get
     HATCH_SKIP_ANIM   = true,  -- НЕ запускать AttemptHatch (обход "Click to open!")
     HATCH_HIDE_GUI    = true,  -- скрыть оверлей EggOpenAnimation (insurance)
     HATCH_RETRY       = 0.15,  -- пауза при отклонённом хэтче (сек)
     HATCH_DEFAULT_COUNT = 27,  -- запасной count, если не удалось определить max
+
+    -- Апгрейды: "priority" | "smart" (самый дешёвый из приоритетных) | "cheapest" (глобально дешёвый)
+    UPGRADE_MODE = "smart",
+
+    -- Авто-вход / питомцы
+    AUTO_ENTER        = true,  -- InstancingCmds.Enter("SoccerEvent") если не в ивенте
+    AUTO_EQUIP_BEST   = true,  -- Pets_EquipBest при старте
+
+    -- Кик: recovery при серверных ошибках
+    KICK_FAIL_REJOIN_AFTER = 8, -- после N подряд fail — Leave+Enter (проверено через MCP)
+
+    -- Доп. клеймы / бусты (проверено через MCP)
+    AUTO_FREE_GIFTS    = true,  -- Redeem Free Gift 1..12 по Save.FreeGiftsRedeemed
+    AUTO_KICK_REWARDS  = true,  -- GenerateReward когда Soccer*Credits >= 10
+    AUTO_CONSUMABLES   = true,  -- авто-юз Cleats / Golden Cleats / Soccer Orb Frenzy
+    SOCCER_CONSUMABLES = { "Golden Cleats", "Cleats", "Soccer Orb Frenzy" },
+    AUTO_FOREVER_FREE  = true,  -- ForeverPacks: Claim Free (если доступно)
 
     -- Оптимизация
     FPS_CAP            = 60,    -- 0 = не трогать
@@ -217,11 +235,17 @@ local Hatching         = safeRequire(Client:FindFirstChild("HatchingCmds"))
 local EggCmds          = safeRequire(Client:FindFirstChild("EggCmds"))
 local CustomEggsCmds   = safeRequire(Client:FindFirstChild("CustomEggsCmds"))
 local LoginStreakCmds  = safeRequire(Client:FindFirstChild("LoginStreakCmds"))
+local ConsumableCmds   = safeRequire(Client:FindFirstChild("ConsumableCmds"))
+local SaveCmds         = safeRequire(Client:FindFirstChild("Save"))
 local SoccerType       = safeRequire(Library.Types and Library.Types:FindFirstChild("Soccer"))
+local ConsumableItem   = safeRequire(Library.Items and Library.Items:FindFirstChild("ConsumableItem"))
 
 -- клейм-ремоуты (RemoteFunction)
 local Rf_LoginClaim = Network:FindFirstChild("Login Streaks: Claim")
 local Rf_MailboxAll = Network:FindFirstChild("Mailbox: Claim All")
+local Rf_FreeGift   = Network:FindFirstChild("Redeem Free Gift")
+local Rf_ForeverFree = Network:FindFirstChild("ForeverPacks: Claim Free")
+local Ev_EquipBest  = Network:FindFirstChild("Pets_EquipBest")
 
 local UpgradeDefsFolder
 do
@@ -243,6 +267,24 @@ local function isPlaying()
     local ok, res = pcall(SoccerType.IsPlaying)
     if not ok then return true end
     return res ~= false
+end
+
+local function getSave()
+    if not SaveCmds or type(SaveCmds.Get) ~= "function" then return nil end
+    local ok, s = pcall(SaveCmds.Get)
+    return ok and s or nil
+end
+
+local function ensureInSoccer()
+    if not CONFIG.AUTO_ENTER or not InstancingCmds then return end
+    if inSoccer() then return end
+    local ok = pcall(InstancingCmds.Enter, "SoccerEvent")
+    if ok then print("[SoccerAuto] Авто-вход в SoccerEvent.") end
+end
+
+local function equipBestPets()
+    if not CONFIG.AUTO_EQUIP_BEST or not Ev_EquipBest then return end
+    pcall(Ev_EquipBest.FireServer, Ev_EquipBest)
 end
 
 ----------------------------------------------------------------
@@ -327,35 +369,49 @@ end
 local Kicker = {}
 do
     local acc = math.clamp(tonumber(CONFIG.KICK_ACCURACY) or 1, 0, 1)
+    local failStreak = 0
+
+    local function disableGameAutoKick()
+        if not InstancingCmds then return end
+        pcall(InstancingCmds.FireCustom, "Auto", false)
+        pcall(InstancingCmds.FireCustom, "AutoThrow", false)
+        pcall(InstancingCmds.FireCustom, "SoccerEventAuto", false)
+    end
 
     function Kicker.run()
-        -- выключаем встроенный авто-кик, чтобы наш цикл был единственным
-        if InstancingCmds then
-            for _ = 1, 6 do
-                if not Runtime.running then return end
-                if inSoccer() then break end
-                task.wait(0.5)
-            end
-            pcall(InstancingCmds.FireCustom, "Auto", false)
+        for _ = 1, 12 do
+            if not Runtime.running then return end
+            if inSoccer() then break end
+            ensureInSoccer()
+            task.wait(0.5)
         end
+        disableGameAutoKick()
 
         while Runtime.running do
-            if inSoccer() then
-                -- На intermission сервер отклоняет кики — не тратим вызовы
-                if CONFIG.PAUSE_ON_INTERMISSION and not isPlaying() then
-                    task.wait(1.0)
-                else
-                    local ok, res = pcall(InvokeCustom.InvokeServer, InvokeCustom,
-                        "SoccerEvent", "InfiniteShoot", acc)
-                    if ok and type(res) == "table" then
-                        Runtime.stats.kicks += 1
-                        task.wait(CONFIG.KICK_RATE)
-                    else
-                        task.wait(CONFIG.KICK_BACKOFF)
-                    end
-                end
-            else
+            if not inSoccer() then
+                ensureInSoccer()
                 task.wait(1.0)
+            elseif CONFIG.PAUSE_ON_INTERMISSION and not isPlaying() then
+                task.wait(1.0)
+            else
+                disableGameAutoKick()
+                local ok, res = pcall(InvokeCustom.InvokeServer, InvokeCustom,
+                    "SoccerEvent", "InfiniteShoot", acc)
+                if ok and type(res) == "table" then
+                    failStreak = 0
+                    Runtime.stats.kicks += 1
+                    task.wait(CONFIG.KICK_RATE)
+                else
+                    failStreak += 1
+                    if failStreak >= (CONFIG.KICK_FAIL_REJOIN_AFTER or 8) and InstancingCmds then
+                        failStreak = 0
+                        pcall(InstancingCmds.Leave)
+                        task.wait(1.0)
+                        pcall(InstancingCmds.Enter, "SoccerEvent")
+                        task.wait(2.0)
+                    end
+                    task.wait(CONFIG.KICK_BACKOFF)
+                end
             end
         end
     end
@@ -376,20 +432,42 @@ do
         return char and char:FindFirstChild("HumanoidRootPart")
     end
 
-    -- Ближайшая будка кастом-яйца. Возвращает UID (имя папки) или nil.
-    local function findNearestBooth()
+    local function eggTier(info)
+        if not info or not info._id then return 0 end
+        local id = info._id
+        return tonumber(id:match("Tier (%d+)"))
+            or tonumber(id:match("Egg (%d+)"))
+            or 0
+    end
+
+    -- Лучшая или ближайшая будка в радиусе.
+    local function findTargetBooth()
+        local uid = CONFIG.HATCH_BOOTH_UID
+        if uid then return uid end
+
         local hrp = getHRP()
         if not hrp then return nil end
         local folder = workspace:FindFirstChild("__THINGS")
         folder = folder and folder:FindFirstChild("CustomEggs")
         if not folder then return nil end
 
-        local bestUID, bestDist
+        local bestUID, bestScore, bestDist
         for _, booth in ipairs(folder:GetChildren()) do
             if booth:FindFirstChild("Egg") and booth:FindFirstChild("Center") then
                 local dist = (booth.Center.Position - hrp.Position).Magnitude
-                if dist <= CONFIG.HATCH_RANGE and (not bestDist or dist < bestDist) then
-                    bestUID, bestDist = booth.Name, dist
+                if dist <= CONFIG.HATCH_RANGE then
+                    local info = getEggInfo(booth.Name)
+                    local tier = eggTier(info)
+                    local pick
+                    if CONFIG.HATCH_BEST_EGG then
+                        pick = tier > (bestScore or -1)
+                            or (tier == (bestScore or -1) and dist < (bestDist or math.huge))
+                    else
+                        pick = not bestDist or dist < bestDist
+                    end
+                    if pick then
+                        bestUID, bestScore, bestDist = booth.Name, tier, dist
+                    end
                 end
             end
         end
@@ -456,7 +534,7 @@ do
     local function hatchOnce()
         if not CustomEggsHatch then return false end
 
-        local uid = CONFIG.HATCH_BOOTH_UID or findNearestBooth()
+        local uid = findTargetBooth()
         if not uid then return false end
 
         local info = getEggInfo(uid)
@@ -556,15 +634,40 @@ do
         local budget = orbs() - CONFIG.ORB_RESERVE
         local priority = CONFIG.PRIORITIZE_100_PERCENT
             and CONFIG.UPGRADE_PRIORITY_100 or CONFIG.UPGRADE_PRIORITY
-        for _, id in ipairs(priority) do
+        local mode = CONFIG.UPGRADE_MODE or "priority"
+
+        local candidates = {}
+        local scan = (mode == "cheapest") and (function()
+            local all = {}
+            for _, id in ipairs(priority) do all[id] = true end
+            if UpgradeDefsFolder then
+                for _, m in ipairs(UpgradeDefsFolder:GetChildren()) do
+                    local def = safeRequire(m)
+                    if def and def._id then all[def._id] = true end
+                end
+            end
+            local list = {}
+            for id in pairs(all) do list[#list + 1] = id end
+            return list
+        end)() or priority
+
+        for _, id in ipairs(scan) do
             local cost, maxed = nextCost(id)
             if not maxed and type(cost) == "number" and cost <= budget then
-                if pcall(EventUpgradeCmds.Purchase, id) then
-                    Runtime.stats.upgrades += 1
-                    print(("[SoccerAuto] Апгрейд %s куплен за %d орбов."):format(id, cost))
-                end
-                return -- одна покупка за тик
+                candidates[#candidates + 1] = { id = id, cost = cost }
             end
+        end
+        if #candidates == 0 then return end
+
+        if mode == "smart" or mode == "cheapest" then
+            table.sort(candidates, function(a, b) return a.cost < b.cost end)
+        end
+
+        local pick = candidates[1]
+        if pcall(EventUpgradeCmds.Purchase, pick.id) then
+            Runtime.stats.upgrades += 1
+            print(("[SoccerAuto] Апгрейд %s куплен за %d орбов (%s).")
+                :format(pick.id, pick.cost, mode))
         end
     end
 end
@@ -585,28 +688,107 @@ local function setupAntiAFK()
 end
 
 ----------------------------------------------------------------
--- 5b) АВТО-КЛЕЙМЫ (Login Streak по CanClaim, Mailbox Claim All)
--- Free Gift НЕ включён: требует конкретный id подарка (сотни типов).
+-- 5b) АВТО-КЛЕЙМЫ
+-- Login Streak, Mailbox, Free Gifts, Kick Rewards, Consumables, ForeverPack
 ----------------------------------------------------------------
-local function claimsTick()
-    -- Login Streak — только если реально доступно
-    if LoginStreakCmds and Rf_LoginClaim then
-        local ok, can = pcall(LoginStreakCmds.CanClaim)
-        if ok and can == true then
-            if pcall(Rf_LoginClaim.InvokeServer, Rf_LoginClaim) then
+local function claimFreeGifts()
+    if not CONFIG.AUTO_FREE_GIFTS or not Rf_FreeGift then return end
+    local save = getSave()
+    if not save then return end
+    local redeemed = {}
+    for _, id in ipairs(save.FreeGiftsRedeemed or {}) do
+        redeemed[id] = true
+    end
+    for i = 1, 12 do
+        if not redeemed[i] then
+            local ok, res = pcall(Rf_FreeGift.InvokeServer, Rf_FreeGift, i)
+            if ok and res == true then
                 Runtime.stats.claims += 1
-                print("[SoccerAuto] Login Streak забран.")
+                redeemed[i] = true
+                print(("[SoccerAuto] Free Gift #%d забран."):format(i))
             end
         end
     end
-    -- Mailbox Claim All — безопасно (возвращает false когда пусто)
-    if Rf_MailboxAll then
-        local ok, res = pcall(Rf_MailboxAll.InvokeServer, Rf_MailboxAll)
-        if ok and res and res ~= false then
-            Runtime.stats.claims += 1
-            print("[SoccerAuto] Mailbox забран.")
+end
+
+local function redeemKickRewards()
+    if not CONFIG.AUTO_KICK_REWARDS or not SoccerType or not InvokeCustom then return end
+    if type(SoccerType.GenerateRewardDirectory) ~= "function" then return end
+    local save = getSave()
+    if not save then return end
+    local ok, dir = pcall(SoccerType.GenerateRewardDirectory)
+    if not ok or type(dir) ~= "table" then return end
+    for id, def in pairs(dir) do
+        if type(def) == "table" and def.SaveKey and def.CreditsRequired then
+            local have = save[def.SaveKey] or 0
+            if have >= def.CreditsRequired then
+                local ok2, res = pcall(InvokeCustom.InvokeServer, InvokeCustom,
+                    "SoccerEvent", "GenerateReward", id)
+                if ok2 and res ~= false then
+                    Runtime.stats.claims += 1
+                    print(("[SoccerAuto] Kick-награда %s (%s)."):format(tostring(id), def.DisplayName or id))
+                end
+            end
         end
     end
+end
+
+local function useSoccerConsumables()
+    if not CONFIG.AUTO_CONSUMABLES or not ConsumableCmds then return end
+    if not inSoccer() then return end
+    for _, id in ipairs(CONFIG.SOCCER_CONSUMABLES or {}) do
+        local amount = 0
+        if ConsumableItem and ConsumableItem.FromId then
+            local ok, item = pcall(ConsumableItem.FromId, id)
+            if ok and item and item.GetAmount then
+                local ok2, amt = pcall(item.GetAmount, item)
+                if ok2 and type(amt) == "number" then amount = amt end
+            end
+        end
+        if amount > 0 then
+            local ok3, res = pcall(ConsumableCmds.Consume, id)
+            if ok3 and res ~= false then
+                Runtime.stats.claims += 1
+                print(("[SoccerAuto] Буст использован: %s"):format(id))
+            end
+        end
+    end
+end
+
+local function claimForeverFree()
+    if not CONFIG.AUTO_FOREVER_FREE or not Rf_ForeverFree then return end
+    local ok, res = pcall(Rf_ForeverFree.InvokeServer, Rf_ForeverFree)
+    if ok and res and res ~= false then
+        Runtime.stats.claims += 1
+        print("[SoccerAuto] ForeverPack free забран.")
+    end
+end
+
+local function claimsTick()
+    if CONFIG.AUTO_CLAIM then
+        if LoginStreakCmds and Rf_LoginClaim then
+            local ok, can = pcall(LoginStreakCmds.CanClaim)
+            if ok and can == true then
+                if pcall(Rf_LoginClaim.InvokeServer, Rf_LoginClaim) then
+                    Runtime.stats.claims += 1
+                    print("[SoccerAuto] Login Streak забран.")
+                end
+            end
+        end
+        if Rf_MailboxAll then
+            local ok, res = pcall(Rf_MailboxAll.InvokeServer, Rf_MailboxAll)
+            if ok and res and res ~= false then
+                Runtime.stats.claims += 1
+                print("[SoccerAuto] Mailbox забран.")
+            end
+        end
+    end
+    claimFreeGifts()
+    if inSoccer() then
+        redeemKickRewards()
+        useSoccerConsumables()
+    end
+    claimForeverFree()
 end
 
 ----------------------------------------------------------------
@@ -719,16 +901,27 @@ end
 
 function App.Status()
     local s = Runtime.stats
-    print(("[SoccerAuto] kicks=%d orbs=%d hatches=%d upgrades=%d claims=%d errors=%d running=%s playing=%s")
+    local save = getSave()
+    local credits = ""
+    if save then
+        credits = (" | gift=%d huge1=%d huge2=%d titanic=%d garg=%d")
+            :format(save.SoccerGiftCredits or 0, save.SoccerHuge1Credits or 0,
+                save.SoccerHuge2Credits or 0, save.SoccerTitanicCredits or 0,
+                save.SoccerGargCredits or 0)
+    end
+    print(("[SoccerAuto] kicks=%d orbs=%d hatches=%d upgrades=%d claims=%d errors=%d running=%s playing=%s%s")
         :format(s.kicks, s.orbs, s.hatches, s.upgrades, s.claims, s.errors,
-            tostring(Runtime.running), tostring(isPlaying())))
+            tostring(Runtime.running), tostring(isPlaying()), credits))
     return s
 end
 
 ----------------------------------------------------------------
 -- ЗАПУСК
 ----------------------------------------------------------------
-print(("[SoccerAuto] v3 старт | executor=%s"):format(tostring(U.identify())))
+print(("[SoccerAuto] v4 старт | executor=%s"):format(tostring(U.identify())))
+
+ensureInSoccer()
+equipBestPets()
 
 if CONFIG.OPTIMIZE_GAME then safe("optimize", applyOptimization) end
 if CONFIG.ANTI_AFK then safe("antiafk", setupAntiAFK) end
@@ -768,8 +961,8 @@ if CONFIG.AUTO_UPGRADE then
     end)
 end
 
-print(("[SoccerAuto] Готов | Орбы:%s Кик:%s Хэтч:%s Апгр:%s Клейм:%s АнтиАФК:%s Реджойн:%s")
+print(("[SoccerAuto] Готов | Орбы:%s Кик:%s Хэтч:%s Апгр:%s Клейм:%s Вход:%s Питомцы:%s АнтиАФК:%s Реджойн:%s")
     :format(tostring(CONFIG.COLLECT_ORBS), tostring(CONFIG.AUTO_KICK), tostring(CONFIG.AUTO_HATCH),
-        tostring(CONFIG.AUTO_UPGRADE), tostring(CONFIG.AUTO_CLAIM), tostring(CONFIG.ANTI_AFK),
-        tostring(CONFIG.AUTO_REJOIN)))
+        tostring(CONFIG.AUTO_UPGRADE), tostring(CONFIG.AUTO_CLAIM), tostring(CONFIG.AUTO_ENTER),
+        tostring(CONFIG.AUTO_EQUIP_BEST), tostring(CONFIG.ANTI_AFK), tostring(CONFIG.AUTO_REJOIN)))
 print("[SoccerAuto] Стоп: getgenv().__SoccerAuto.Stop()  |  Статус: getgenv().__SoccerAuto.Status()")
