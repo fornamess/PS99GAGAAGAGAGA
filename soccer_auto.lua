@@ -1340,15 +1340,12 @@ do
 end
 
 ----------------------------------------------------------------
--- 4b) АВТО-ЭКИП ЛУЧШИХ ПИТОМЦЕВ
--- GetSortedPets = та же сортировка, что «сила» в инвентаре (300k > 80k).
--- EquipBest/LD_BestFit иногда одевает слабых (стacks/best-fit) — опционально.
+-- 4b) АВТО-ЭКИП  (PetCmds.EquipBest → LD_BestFit)
 ----------------------------------------------------------------
 local PetEquip = {}
 do
     local lastEquipAt = 0
     local lastEquippedN = -1
-    local lastTopUid = nil
 
     local function countEquipped()
         if not PetCmds then return 0 end
@@ -1361,29 +1358,6 @@ do
         if not PetCmds then return 0 end
         local ok, n = pcall(PetCmds.GetMaxEquipped)
         return (ok and type(n) == "number") and n or 0
-    end
-
-    local function getSortedPets()
-        if not PetCmds then return nil end
-        local ok, list = pcall(PetCmds.GetSortedPets)
-        return (ok and type(list) == "table") and list or nil
-    end
-
-    local function petUid(p)
-        if not p or type(p.GetUID) ~= "function" then return nil end
-        local ok, uid = pcall(p.GetUID, p)
-        return ok and uid or nil
-    end
-
-    local function equippedUidSet()
-        local set = {}
-        local ok, items = pcall(PetCmds.GetEquippedItems)
-        if not ok or type(items) ~= "table" then return set end
-        for _, p in ipairs(items) do
-            local uid = petUid(p)
-            if uid then set[uid] = true end
-        end
-        return set
     end
 
     local function ensureGameAutoEquip()
@@ -1404,7 +1378,7 @@ do
         end
     end
 
-    local function fireEquipBestFit()
+    local function fireEquipBest()
         if PetCmds and type(PetCmds.EquipBest) == "function" then
             local ok = pcall(PetCmds.EquipBest)
             if ok then return true end
@@ -1415,78 +1389,31 @@ do
         return false
     end
 
-    local function needsReequip(sorted, max, force)
-        if force then return true end
-        if not sorted or #sorted == 0 then return false end
-        local targetN = math.min(max, #sorted)
-        local n = countEquipped()
-        if n < targetN then return true end
-        local topUid = petUid(sorted[1])
-        if topUid and topUid ~= lastTopUid then return true end
-        if topUid then
-            local eq = equippedUidSet()
-            if not eq[topUid] then return true end
-        end
-        return false
-    end
-
-    local function equipTopSorted(max)
-        local sorted = getSortedPets()
-        if not sorted or #sorted == 0 then return false, 0 end
-        local targetN = math.min(max, #sorted)
-        pcall(PetCmds.UnequipAll)
-        task.wait(0.12)
-        local n = 0
-        for i = 1, targetN do
-            local uid = petUid(sorted[i])
-            if uid and pcall(PetCmds.Equip, uid) then
-                n += 1
-            end
-        end
-        lastTopUid = petUid(sorted[1])
-        return n > 0, n
-    end
-
     function PetEquip.tick(force)
         if not CONFIG.AUTO_EQUIP_PETS or not PetCmds then return end
         local now = os.clock()
         local cd = CONFIG.EQUIP_BEST_COOLDOWN or 8
         if not force and (now - lastEquipAt) < cd then return end
 
-        local max = maxSlots()
-        if max <= 0 then return end
-
-        disableFavoriteOnly()
-        ensureGameAutoEquip()
-
-        local mode = CONFIG.EQUIP_MODE or "sorted"
-        local sorted = getSortedPets()
-        if mode == "sorted" and not needsReequip(sorted, max, force) then
-            return
-        end
-        if mode ~= "sorted" and not force then
+        if not force then
             local ok, maxed = pcall(PetCmds.IsMaxEquipped)
             if ok and maxed == true then return end
         end
 
+        disableFavoriteOnly()
+        ensureGameAutoEquip()
+
         local before = countEquipped()
-        local okEquip = false
-        if mode == "bestfit" then
-            okEquip = fireEquipBestFit()
-        else
-            okEquip = select(1, equipTopSorted(max))
-        end
-        if not okEquip then return end
+        if not fireEquipBest() then return end
         lastEquipAt = now
 
         task.defer(function()
-            task.wait(0.45)
+            task.wait(0.4)
             local after = countEquipped()
+            local max = maxSlots()
             if after ~= lastEquippedN or (force and after ~= before) then
                 lastEquippedN = after
-                local topName = sorted and sorted[1] and sorted[1].GetName and sorted[1]:GetName() or "?"
-                print(("[SoccerAuto] Экип топ-петов (%s): %d/%d | лучший: %s")
-                    :format(mode, after, max, topName))
+                print(("[SoccerAuto] Equip Best: %d/%d"):format(after, max))
             end
         end)
     end
@@ -1495,7 +1422,6 @@ do
         PetEquip.tick(true)
     end
 end
-
 ----------------------------------------------------------------
 -- 5) АНТИ-АФК
 ----------------------------------------------------------------
