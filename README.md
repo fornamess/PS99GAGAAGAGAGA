@@ -4,17 +4,26 @@
 
 ## Запуск
 
-Вставь в executor одну строку:
-
-```lua
-loadstring(game:HttpGet("https://raw.githubusercontent.com/fornamess/PS99GAGAAGAGAGA/main/soccer_auto.lua"))()
-```
-
-Или загрузи короткий лоадер:
-
 ```lua
 loadstring(game:HttpGet("https://raw.githubusercontent.com/fornamess/PS99GAGAAGAGAGA/main/load.lua"))()
 ```
+
+## Зависание на BIG GAMES без фокуса окна
+
+Roblox на Windows **почти останавливает клиент**, если окно не в фокусе. Экран BIG GAMES (Intro + PreloadAsync) из-за этого может висеть бесконечно.
+
+**Что делать:**
+
+1. Запусти **`focus_helper.ps1`** — автоматически даёт фокус новым окнам Roblox на ~25 секунд при реджойне:
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File focus_helper.ps1
+   ```
+   Для нескольких аккаунтов:
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File focus_helper.ps1 -RotateMulti
+   ```
+
+2. Скрипт грузит **`bootstrap.lua`** первым — отключает Intro и ускоряет PreloadAsync (помогает, но **не заменяет** фокус окна).
 
 ## Управление
 
@@ -25,6 +34,6 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/fornamess/PS99GAGAAGA
 
 ## Настройки
 
-Все опции в начале файла `soccer_auto.lua` в таблице `CONFIG`.
+Все опции в начале `soccer_auto.lua` в таблице `CONFIG`.
 
-После телепорта/реджойна скрипт перезапускается сам (через `queue_on_teleport` + GitHub URL).
+После телепорта/реджойна скрипт перезапускается сам (`queue_on_teleport` + GitHub + bootstrap).

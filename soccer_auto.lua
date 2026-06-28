@@ -90,10 +90,37 @@ local CONFIG = {
     -- Авто-перезапуск
     AUTO_REJOIN       = true,  -- реджойн при вылете/дисконнекте
     QUEUE_ON_TELEPORT = true,  -- авто-перезапуск скрипта после телепорта/реджойна
+    GITHUB_BASE       = "https://raw.githubusercontent.com/fornamess/PS99GAGAAGAGAGA/main",
     GITHUB_RAW_URL    = "https://raw.githubusercontent.com/fornamess/PS99GAGAAGAGAGA/main/soccer_auto.lua",
     SCRIPT_PATH       = "soccer_auto.lua", -- запасной локальный путь, если GITHUB_RAW_URL пуст
+
+    -- Обход зависания BIG GAMES без фокуса окна (Intro + PreloadAsync).
+    -- Luau не может дать OS-фокус — параллельно запусти focus_helper.ps1 на Windows.
+    BYPASS_LOAD_STALL = true,
 }
 --===========================================================--
+
+-- Ранний bootstrap (Intro/PreloadAsync) — до инициализации скрипта
+if CONFIG.BYPASS_LOAD_STALL then
+    pcall(function()
+        local base = CONFIG.GITHUB_BASE or ""
+        if base ~= "" and game.HttpGet then
+            loadstring(game:HttpGet(base .. "/bootstrap.lua"))()
+        else
+            -- inline fallback, если HttpGet недоступен
+            local G = (getgenv and getgenv()) or _G
+            if not G.__PS99BootstrapDone then
+                G.__PS99BootstrapDone = true
+                pcall(function()
+                    local RF = game:GetService("ReplicatedFirst")
+                    RF:RemoveDefaultLoadingScreen()
+                    local intro = RF:FindFirstChild("Intro")
+                    if intro then intro.Disabled = true end
+                end)
+            end
+        end
+    end)
+end
 
 ----------------------------------------------------------------
 -- окружение / утилиты executor (UNC/sUNC)
@@ -597,9 +624,13 @@ local function setupAutoRejoin()
         local code
 
         if type(url) == "string" and url ~= "" then
-            code = ('loadstring(game:HttpGet("%s"))()'):format(url)
+            local base = CONFIG.GITHUB_BASE or url:gsub("/soccer_auto%.lua$", "")
+            code = ([[
+loadstring(game:HttpGet("%s/bootstrap.lua"))()
+loadstring(game:HttpGet("%s/soccer_auto.lua"))()
+]]):format(base, base)
             pcall(queue_on_teleport, code)
-            print("[SoccerAuto] Авто-перезапуск после телепорта настроен (GitHub).")
+            print("[SoccerAuto] Авто-перезапуск после телепорта настроен (GitHub + bootstrap).")
         elseif type(readfile) == "function" and type(isfile) == "function"
             and isfile(path) then
             code = ("local s='%s' if isfile and isfile(s) then loadstring(readfile(s))() end")
