@@ -1,6 +1,6 @@
 --[[
     ================================================================
-       SOCCER EVENT AUTO  v5.15  —  Pet Sim 99 / Soccer Event
+       SOCCER EVENT AUTO  v5.17  —  Pet Sim 99 / Soccer Event
     ================================================================
     Полностью исследовано вживую через Roblox MCP (placeId 8737899170,
     executor Volt 1.2.24.3). Все механики подтверждены на реальной игре.
@@ -105,8 +105,9 @@ local CONFIG = {
     AUTO_ZONE_PROGRESS  = true,  -- авто-прогрессия зон 1→5 (Shoot + покупка зон)
     MAX_SOCCER_ZONE     = 5,
 
-    -- Кик: recovery при серверных ошибках
-    KICK_FAIL_HOP_AFTER = 8,     -- после N fail — Move Server (hop)
+    -- Кик: recovery при серверных ошибках (Move Server — hop внутри того же place)
+    KICK_FAIL_HOP       = false, -- true = hop после серии fail; по умолчанию выкл (ложные fail у яйца)
+    KICK_FAIL_HOP_AFTER = 8,     -- сколько fail подряд (только если KICK_FAIL_HOP = true)
 
     -- Доп. клеймы / бусты (проверено через MCP)
     AUTO_FREE_GIFTS    = true,  -- Redeem Free Gift 1..12 по Save.FreeGiftsRedeemed
@@ -263,6 +264,10 @@ local FireCustom   = Network:WaitForChild("Instancing_FireCustomFromClient", 10)
 local InvokeCustom = Network:WaitForChild("Instancing_InvokeCustomFromClient", 10)
 local CustomEggsHatch = Network:WaitForChild("CustomEggs_Hatch", 10)
 local AutoHatchEnable = Network:FindFirstChild("AutoHatch_Enable")
+if not InvokeCustom then
+    warn("[SoccerAuto] Instancing_InvokeCustomFromClient не найден — кик отключён.")
+    CONFIG.AUTO_KICK = false
+end
 
 local Client = Library:WaitForChild("Client", 10)
 local InstancingCmds   = safeRequire(Client:FindFirstChild("InstancingCmds"))
@@ -309,6 +314,72 @@ local function isPlaying()
     local ok, res = pcall(SoccerType.IsPlaying)
     if not ok then return true end
     return res ~= false
+end
+
+-- Перезапуск после hop/телепорта (Move Server не всегда триггерит queue_on_teleport)
+local function buildQueueLoader()
+    local base = CONFIG.GITHUB_BASE or ""
+    if base == "" then
+        local url = CONFIG.GITHUB_RAW_URL or ""
+        base = url:gsub("/soccer_auto%.lua$", "")
+    end
+    local path = CONFIG.SCRIPT_PATH or "soccer_auto.lua"
+    if type(readfile) == "function" and type(isfile) == "function" and isfile(path) then
+        return ([=[
+repeat task.wait() until game:IsLoaded()
+game:GetService("ReplicatedStorage"):WaitForChild("Network", 120)
+local function loadLocal(p)
+    if isfile and isfile(p) then loadstring(readfile(p), p)() end
+end
+loadLocal("bootstrap.lua")
+loadLocal("%s")
+]=]):format(path:gsub("\\", "\\\\"))
+    end
+    if base ~= "" then
+        return ([=[
+repeat task.wait() until game:IsLoaded()
+game:GetService("ReplicatedStorage"):WaitForChild("Network", 120)
+loadstring(game:HttpGet("%s/bootstrap.lua"), "bootstrap")()
+loadstring(game:HttpGet("%s/soccer_auto.lua"), "soccer_auto")()
+]=]):format(base, base)
+    end
+    return nil
+end
+
+local function queueScriptRestart()
+    if not CONFIG.QUEUE_ON_TELEPORT or type(queue_on_teleport) ~= "function" then return false end
+    local code = buildQueueLoader()
+    if not code then return false end
+    return pcall(queue_on_teleport, code)
+end
+
+local function reloadSoccerAutoFromSource()
+    local code = buildQueueLoader()
+    if not code then return false end
+    local fn = loadstring(code)
+    if not fn then return false end
+    return pcall(fn)
+end
+
+local hopInProgress = false
+local function hopToNewServer(reason)
+    if hopInProgress or not Ev_MoveServer then return end
+    hopInProgress = true
+    queueScriptRestart()
+    local jobBefore = game.JobId
+    print(("[SoccerAuto] Hop на другой сервер (%s)…"):format(tostring(reason or "?")))
+    pcall(Ev_MoveServer.FireServer, Ev_MoveServer)
+    task.spawn(function()
+        for _ = 1, 90 do
+            task.wait(1)
+            if game.JobId ~= jobBefore then
+                task.wait(4)
+                reloadSoccerAutoFromSource()
+                break
+            end
+        end
+        hopInProgress = false
+    end)
 end
 
 local function getSave()
@@ -624,6 +695,7 @@ end
 local Kicker = {}
 do
     local failStreak = 0
+    local lastFailLog = 0
 
     local function kickAccuracy(cmd)
         if cmd == "Shoot" then
@@ -649,6 +721,10 @@ do
         pcall(InstancingCmds.FireCustom, "SoccerEventAuto", false)
     end
 
+    function Kicker.resetFails()
+        failStreak = 0
+    end
+
     function Kicker.run()
         for _ = 1, 12 do
             if not Runtime.running then return end
@@ -663,8 +739,12 @@ do
                 ensureInSoccer()
                 task.wait(1.0)
             elseif CONFIG.PAUSE_ON_INTERMISSION and not isPlaying() then
+                failStreak = 0
                 task.wait(1.0)
             else
+                if not InvokeCustom then
+                    task.wait(1.0)
+                else
                 disableGameAutoKick()
                 local gatePhase = not ZoneProgress.isComplete()
                 if gatePhase then
@@ -689,17 +769,109 @@ do
                     task.wait(gatePhase and (CONFIG.GATE_KICK_RATE or 1.1) or CONFIG.KICK_RATE)
                 else
                     failStreak += 1
-                    if failStreak >= (CONFIG.KICK_FAIL_HOP_AFTER or 8) and Ev_MoveServer then
+                    local now = os.clock()
+                    if (now - lastFailLog) >= 8 then
+                        lastFailLog = now
+                        local resInfo = type(res) == "table" and "table" or tostring(res)
+                        print(("[SoccerAuto] Кик отклонён (%s): ok=%s res=%s | streak=%d")
+                            :format(cmd, tostring(ok), resInfo, failStreak))
+                    end
+                    local hopAfter = CONFIG.KICK_FAIL_HOP_AFTER or 0
+                    if CONFIG.KICK_FAIL_HOP and hopAfter > 0 and failStreak >= hopAfter then
                         failStreak = 0
-                        print("[SoccerAuto] Кик fail — hop на другой сервер…")
-                        pcall(Ev_MoveServer.FireServer, Ev_MoveServer)
+                        hopToNewServer("кик fail")
                         task.wait(5.0)
                         ensureInSoccer()
                     end
                     task.wait(CONFIG.KICK_BACKOFF)
                 end
+                end
             end
         end
+    end
+end
+
+----------------------------------------------------------------
+-- 4b) АВТО-ЭКИП  (PetCmds.EquipBest → LD_BestFit)
+----------------------------------------------------------------
+local PetEquip = {}
+do
+    local lastEquipAt = 0
+    local lastEquippedN = -1
+
+    local function countEquipped()
+        if not PetCmds then return 0 end
+        local ok, items = pcall(PetCmds.GetEquippedItems)
+        if ok and type(items) == "table" then return #items end
+        return 0
+    end
+
+    local function maxSlots()
+        if not PetCmds then return 0 end
+        local ok, n = pcall(PetCmds.GetMaxEquipped)
+        return (ok and type(n) == "number") and n or 0
+    end
+
+    local function ensureGameAutoEquip()
+        if not CONFIG.EQUIP_ENSURE_AUTO or not PetCmds then return end
+        local ok, on = pcall(PetCmds.IsAutoEquipEnabled)
+        if ok and on == false and type(PetCmds.ToggleAutoEquip) == "function" then
+            pcall(PetCmds.ToggleAutoEquip)
+        end
+    end
+
+    local function disableFavoriteOnly()
+        if not CONFIG.EQUIP_DISABLE_FAVORITE or not PetCmds then return end
+        if type(PetCmds.IsFavoriteModeEnabled) ~= "function" then return end
+        if type(PetCmds.ToggleFavoriteMode) ~= "function" then return end
+        local ok, on = pcall(PetCmds.IsFavoriteModeEnabled)
+        if ok and on == true then
+            pcall(PetCmds.ToggleFavoriteMode)
+        end
+    end
+
+    local function fireEquipBest()
+        if PetCmds and type(PetCmds.EquipBest) == "function" then
+            local ok = pcall(PetCmds.EquipBest)
+            if ok then return true end
+        end
+        if Ev_EquipBest then
+            return pcall(Ev_EquipBest.FireServer, Ev_EquipBest, "LD_BestFit")
+        end
+        return false
+    end
+
+    function PetEquip.tick(force)
+        if not CONFIG.AUTO_EQUIP_PETS or not PetCmds then return end
+        local now = os.clock()
+        local cd = CONFIG.EQUIP_BEST_COOLDOWN or 8
+        if not force and (now - lastEquipAt) < cd then return end
+
+        if not force then
+            local ok, maxed = pcall(PetCmds.IsMaxEquipped)
+            if ok and maxed == true then return end
+        end
+
+        disableFavoriteOnly()
+        ensureGameAutoEquip()
+
+        local before = countEquipped()
+        if not fireEquipBest() then return end
+        lastEquipAt = now
+
+        task.defer(function()
+            task.wait(0.4)
+            local after = countEquipped()
+            local max = maxSlots()
+            if after ~= lastEquippedN or (force and after ~= before) then
+                lastEquippedN = after
+                print(("[SoccerAuto] Equip Best: %d/%d"):format(after, max))
+            end
+        end)
+    end
+
+    function PetEquip.afterHatch()
+        PetEquip.tick(true)
     end
 end
 
@@ -1174,9 +1346,10 @@ do
             Runtime._eggWaitLogged = false
             Runtime._latchedBooth = uid
             Runtime._latchedHatchOk = true
-            if CONFIG.AUTO_EQUIP_PETS then
-                PetEquip.afterHatch()
+            if CONFIG.AUTO_EQUIP_PETS and PetEquip and PetEquip.afterHatch then
+                safe("equip", PetEquip.afterHatch)
             end
+            if Kicker.resetFails then Kicker.resetFails() end
             return true
         end
         if center and getHRP() then
@@ -1339,89 +1512,7 @@ do
     end
 end
 
-----------------------------------------------------------------
--- 4b) АВТО-ЭКИП  (PetCmds.EquipBest → LD_BestFit)
-----------------------------------------------------------------
-local PetEquip = {}
-do
-    local lastEquipAt = 0
-    local lastEquippedN = -1
 
-    local function countEquipped()
-        if not PetCmds then return 0 end
-        local ok, items = pcall(PetCmds.GetEquippedItems)
-        if ok and type(items) == "table" then return #items end
-        return 0
-    end
-
-    local function maxSlots()
-        if not PetCmds then return 0 end
-        local ok, n = pcall(PetCmds.GetMaxEquipped)
-        return (ok and type(n) == "number") and n or 0
-    end
-
-    local function ensureGameAutoEquip()
-        if not CONFIG.EQUIP_ENSURE_AUTO or not PetCmds then return end
-        local ok, on = pcall(PetCmds.IsAutoEquipEnabled)
-        if ok and on == false and type(PetCmds.ToggleAutoEquip) == "function" then
-            pcall(PetCmds.ToggleAutoEquip)
-        end
-    end
-
-    local function disableFavoriteOnly()
-        if not CONFIG.EQUIP_DISABLE_FAVORITE or not PetCmds then return end
-        if type(PetCmds.IsFavoriteModeEnabled) ~= "function" then return end
-        if type(PetCmds.ToggleFavoriteMode) ~= "function" then return end
-        local ok, on = pcall(PetCmds.IsFavoriteModeEnabled)
-        if ok and on == true then
-            pcall(PetCmds.ToggleFavoriteMode)
-        end
-    end
-
-    local function fireEquipBest()
-        if PetCmds and type(PetCmds.EquipBest) == "function" then
-            local ok = pcall(PetCmds.EquipBest)
-            if ok then return true end
-        end
-        if Ev_EquipBest then
-            return pcall(Ev_EquipBest.FireServer, Ev_EquipBest, "LD_BestFit")
-        end
-        return false
-    end
-
-    function PetEquip.tick(force)
-        if not CONFIG.AUTO_EQUIP_PETS or not PetCmds then return end
-        local now = os.clock()
-        local cd = CONFIG.EQUIP_BEST_COOLDOWN or 8
-        if not force and (now - lastEquipAt) < cd then return end
-
-        if not force then
-            local ok, maxed = pcall(PetCmds.IsMaxEquipped)
-            if ok and maxed == true then return end
-        end
-
-        disableFavoriteOnly()
-        ensureGameAutoEquip()
-
-        local before = countEquipped()
-        if not fireEquipBest() then return end
-        lastEquipAt = now
-
-        task.defer(function()
-            task.wait(0.4)
-            local after = countEquipped()
-            local max = maxSlots()
-            if after ~= lastEquippedN or (force and after ~= before) then
-                lastEquippedN = after
-                print(("[SoccerAuto] Equip Best: %d/%d"):format(after, max))
-            end
-        end)
-    end
-
-    function PetEquip.afterHatch()
-        PetEquip.tick(true)
-    end
-end
 ----------------------------------------------------------------
 -- 5) АНТИ-АФК
 ----------------------------------------------------------------
@@ -1549,39 +1640,19 @@ local function setupAutoRejoin()
     local GuiService = svc("GuiService")
     local placeId = game.PlaceId
 
-    -- queue_on_teleport: перезапустить скрипт после любого телепорта/реджойна
     if CONFIG.QUEUE_ON_TELEPORT and type(queue_on_teleport) == "function" then
-        local url = CONFIG.GITHUB_RAW_URL
-        local path = CONFIG.SCRIPT_PATH
-        local code
-
-        if type(readfile) == "function" and type(isfile) == "function"
-            and isfile(path) then
-            code = ([[
-local function loadLocal(p)
-    if isfile and isfile(p) then loadstring(readfile(p))() end
-end
-loadLocal("bootstrap.lua")
-loadLocal("%s")
-]]):format(path:gsub("\\", "\\\\"))
-            pcall(queue_on_teleport, code)
-            print("[SoccerAuto] Авто-перезапуск после телепорта настроен (локальные файлы).")
-        elseif type(url) == "string" and url ~= "" then
-            local base = CONFIG.GITHUB_BASE or url:gsub("/soccer_auto%.lua$", "")
-            code = ([[
-loadstring(game:HttpGet("%s/bootstrap.lua"))()
-loadstring(game:HttpGet("%s/soccer_auto.lua"))()
-]]):format(base, base)
-            pcall(queue_on_teleport, code)
-            print("[SoccerAuto] Авто-перезапуск после телепорта настроен (GitHub).")
+        if queueScriptRestart() then
+            local src = (CONFIG.GITHUB_BASE and CONFIG.GITHUB_BASE ~= "") and "GitHub" or "локальные файлы"
+            print(("[SoccerAuto] Авто-перезапуск после телепорта настроен (%s)."):format(src))
         else
-            print(("[SoccerAuto] Для авто-перезапуска укажи GITHUB_RAW_URL или сохрани скрипт как '%s'."):format(path))
+            print(("[SoccerAuto] Для авто-перезапуска укажи GITHUB_BASE или сохрани скрипт как '%s'.")
+                :format(CONFIG.SCRIPT_PATH or "soccer_auto.lua"))
         end
     end
 
-    -- авто-реджойн при ошибке соединения / вылете
     if CONFIG.AUTO_REJOIN then
         local function rejoin()
+            queueScriptRestart()
             pcall(function()
                 TeleportService:Teleport(placeId, LocalPlayer)
             end)
@@ -1775,7 +1846,7 @@ end
 ----------------------------------------------------------------
 -- ЗАПУСК
 ----------------------------------------------------------------
-print(("[SoccerAuto] v5.15 старт | executor=%s"):format(tostring(U.identify())))
+print(("[SoccerAuto] v5.17 старт | executor=%s"):format(tostring(U.identify())))
 
 ensureInSoccer()
 if CONFIG.AUTO_EQUIP_PETS then
