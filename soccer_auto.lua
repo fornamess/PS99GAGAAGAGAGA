@@ -1,6 +1,6 @@
 --[[
     ================================================================
-       SOCCER EVENT AUTO  v5  —  Pet Sim 99 / Soccer Event
+       SOCCER EVENT AUTO  v5.12  —  Pet Sim 99 / Soccer Event
     ================================================================
     Полностью исследовано вживую через Roblox MCP (placeId 8737899170,
     executor Volt 1.2.24.3). Все механики подтверждены на реальной игре.
@@ -43,8 +43,10 @@ local CONFIG = {
     OPTIMIZE_GAME = true,  -- обратимая оптимизация графики
 
     -- Кик
-    KICK_ACCURACY = 1.0,   -- 0..1, 1.0 = идеал (игра шлёт ~0.98)
-    KICK_RATE     = 3.05,  -- пауза между киками (сек). Серверный guard = 3с.
+    KICK_ACCURACY = 1.0,   -- InfiniteShoot (endgame)
+    GATE_KICK_ACCURACY = 0.99, -- Shoot по воротам — игра шлёт 0.98–0.99 (хук)
+    KICK_RATE     = 3.05,  -- пауза между киками InfiniteShoot (сек). Guard = 3с.
+    GATE_KICK_RATE = 2.5,  -- пауза между ударами по воротам (Shoot)
     KICK_BACKOFF  = 0.6,   -- пауза, если кик отклонён сервером
 
     -- Орбы
@@ -69,13 +71,20 @@ local CONFIG = {
     -- Анимация "Click to open!" обходится: шлём CustomEggs_Hatch напрямую без
     -- AttemptHatch (это и есть анимация). Темп держит сам сервер (debounce ~1.6с).
     HATCH_RANGE       = 25,    -- радиус поиска будки (studs)
-    HATCH_BEST_EGG    = true,  -- true = лучший tier в радиусе; false = ближайшая будка
+    HATCH_BEST_EGG    = true,  -- лучший Soccer Egg в ивенте (Egg N * 100 + Tier)
+    HATCH_INSTANCE_ONLY = true, -- в SoccerEvent только будки внутри инстанса
     HATCH_BOOTH_UID   = nil,   -- nil = авто; или GUID вручную
     HATCH_EGG_ID      = nil,   -- nil = авто через CustomEggsCmds.Get
     HATCH_SKIP_ANIM   = true,  -- НЕ запускать AttemptHatch (обход "Click to open!")
-    HATCH_HIDE_GUI    = true,  -- скрыть оверлей EggOpenAnimation (insurance)
+    HATCH_SKIP_SETUP  = true,  -- НЕ SetupCustomEgg/AutoHatch_Enable (анимация + Walk away + скрытие Main)
+    HATCH_HIDE_GUI    = true,  -- скрыть VFX хэтча (Camera + оверлеи), Main/инвентарь не трогаем
     HATCH_RETRY       = 0.15,  -- пауза при отклонённом хэтче (сек)
+    HATCH_WAIT_BEST   = 0.4,   -- пауза, пока Egg 5 не прогрузится (streaming)
+    HATCH_SUPPRESS_SEC = 4,    -- окно очистки Camera VFX после хэтча
     HATCH_DEFAULT_COUNT = 27,  -- запасной count, если не удалось определить max
+    EGG_ZONE_TP_COOLDOWN = 8.0, -- не чаще телепорта к зоне яиц (сек)
+    EGG_ZONE_NEAR_DIST  = 180,  -- уже в Area N — не телепортировать повторно
+    EGG_STREAM_WAIT   = 0.35,  -- пауза после телепорта для streaming CustomEggs
 
     -- Апгрейды: "priority" | "smart" (самый дешёвый из приоритетных) | "cheapest" (глобально дешёвый)
     UPGRADE_MODE = "smart",
@@ -83,7 +92,8 @@ local CONFIG = {
     -- Авто-вход / телепорты
     AUTO_ENTER          = true,  -- InstancingCmds.Enter("SoccerEvent")
     AUTO_TELEPORT_EGG   = true,  -- телепорт к лучшему яйцу (кик без телепорта)
-    TELEPORT_EGG_DIST   = 12,    -- телепорт, если дальше N studs от будки
+    TELEPORT_EGG_DIST   = 12,    -- телепорт к будке, если дальше N studs
+    EGG_BOOTH_TP_COOLDOWN = 2.0, -- не чаще привязки к будке (сек)
     AUTO_ZONE_PROGRESS  = true,  -- авто-прогрессия зон 1→5 (Shoot + покупка зон)
     MAX_SOCCER_ZONE     = 5,
 
@@ -133,9 +143,17 @@ local CONFIG = {
 if CONFIG.BYPASS_LOAD_STALL then
     pcall(function()
         local base = CONFIG.GITHUB_BASE or ""
-        if base ~= "" and game.HttpGet then
+        local loaded = false
+        if type(readfile) == "function" and type(isfile) == "function" and isfile("bootstrap.lua") then
+            local src = readfile("bootstrap.lua")
+            if type(src) == "string" and src ~= "" then
+                loadstring(src)()
+                loaded = true
+            end
+        end
+        if not loaded and base ~= "" and game.HttpGet then
             loadstring(game:HttpGet(base .. "/bootstrap.lua"))()
-        else
+        elseif not loaded then
             -- inline fallback, если HttpGet недоступен
             local G = (getgenv and getgenv()) or _G
             if not G.__PS99BootstrapDone then
@@ -293,7 +311,14 @@ local function ensureInSoccer()
     if not CONFIG.AUTO_ENTER or not InstancingCmds then return end
     if inSoccer() then return end
     local ok = pcall(InstancingCmds.Enter, "SoccerEvent")
-    if ok then print("[SoccerAuto] Авто-вход в SoccerEvent.") end
+    if ok then
+        print("[SoccerAuto] Авто-вход в SoccerEvent.")
+        task.defer(function()
+            if InvokeCustom then
+                pcall(InvokeCustom.InvokeServer, InvokeCustom, "SoccerEvent", "RequestAllBalls")
+            end
+        end)
+    end
 end
 
 ----------------------------------------------------------------
@@ -315,6 +340,13 @@ local function teleportTo(pos)
     local hrp = getHRP()
     if not hrp or typeof(pos) ~= "Vector3" then return false end
     pcall(function() hrp.CFrame = CFrame.new(pos) end)
+    return true
+end
+
+local function teleportToCFrame(cf)
+    local hrp = getHRP()
+    if not hrp or typeof(cf) ~= "CFrame" then return false end
+    pcall(function() hrp.CFrame = cf end)
     return true
 end
 
@@ -343,6 +375,15 @@ do
 
     function ZoneProgress.getKickCommand()
         return ZoneProgress.isComplete() and "InfiniteShoot" or "Shoot"
+    end
+
+    function ZoneProgress.getOwnedZone()
+        local owned = 1
+        if InstanceZoneCmds then
+            local ok, n = pcall(InstanceZoneCmds.GetMaximumOwnedZoneNumber)
+            if ok and type(n) == "number" and n >= 1 then owned = n end
+        end
+        return owned
     end
 
     local function findAreaFolder(zoneNum)
@@ -390,6 +431,54 @@ do
         return false
     end
 
+    function ZoneProgress.requestBalls()
+        if InvokeCustom then
+            pcall(InvokeCustom.InvokeServer, InvokeCustom, "SoccerEvent", "RequestAllBalls")
+        end
+    end
+
+    function ZoneProgress.getKickCFrame(zoneNum)
+        local inst = getSoccerInstance()
+        if not inst then return nil end
+        local gates = inst:FindFirstChild("Gates")
+        local gate = gates and gates:GetChildren()[zoneNum]
+        local gp = gate and (gate:IsA("BasePart") and gate or gate:FindFirstChildWhichIsA("BasePart", true))
+        if not gp then return nil end
+
+        local stand
+        local teleports = inst:FindFirstChild("Teleports")
+        local tp = teleports and teleports:FindFirstChild(tostring(zoneNum))
+        if tp then
+            stand = tp:IsA("BasePart") and tp or tp:FindFirstChildWhichIsA("BasePart", true)
+        end
+        if not stand then
+            local area = findAreaFolder(zoneNum)
+            local throw = area and area:FindFirstChild("ThrowZone", true)
+            if throw then
+                stand = throw:IsA("BasePart") and throw or throw:FindFirstChildWhichIsA("BasePart", true)
+            end
+        end
+        if stand then
+            local dir = (gp.Position - stand.Position).Unit
+            return CFrame.new(stand.Position + dir * 4 + Vector3.new(0, 2, 0), gp.Position)
+        end
+        return nil
+    end
+
+    function ZoneProgress.needReposition(zoneNum)
+        local cf = ZoneProgress.getKickCFrame(zoneNum)
+        local hrp = getHRP()
+        if not cf or not hrp then return true end
+        return (hrp.Position - cf.Position).Magnitude > 8
+    end
+
+    function ZoneProgress.teleportToKickSpot(zoneNum)
+        ZoneProgress.requestBalls()
+        local cf = ZoneProgress.getKickCFrame(zoneNum)
+        if cf and teleportToCFrame(cf) then return true end
+        return ZoneProgress.teleportToZone(zoneNum)
+    end
+
     function ZoneProgress.tryPurchaseNext()
         if not InstanceZoneCmds or not Rf_ZonePurchase then return false end
         local owned = 0
@@ -407,15 +496,13 @@ do
         return false
     end
 
-    function ZoneProgress.tick()
+    function ZoneProgress.tick(force)
         if ZoneProgress.isComplete() or not InstanceZoneCmds then return end
-        local target = maxZone()
-        local ok, owned = pcall(InstanceZoneCmds.GetMaximumOwnedZoneNumber)
-        if ok and type(owned) == "number" then
-            target = math.min(owned + 1, maxZone())
-        end
+        local owned = ZoneProgress.getOwnedZone()
         ZoneProgress.tryPurchaseNext()
-        ZoneProgress.teleportToZone(target)
+        if force or ZoneProgress.needReposition(owned) then
+            ZoneProgress.teleportToKickSpot(owned)
+        end
     end
 end
 
@@ -487,6 +574,9 @@ do
                 if id == "SoccerEvent" then
                     OrbCollector.reset()
                     findAccessor()
+                    if InvokeCustom then
+                        pcall(InvokeCustom.InvokeServer, InvokeCustom, "SoccerEvent", "RequestAllBalls")
+                    end
                 end
             end))
         end
@@ -523,11 +613,27 @@ end
 ----------------------------------------------------------------
 local Kicker = {}
 do
-    local acc = math.clamp(tonumber(CONFIG.KICK_ACCURACY) or 1, 0, 1)
     local failStreak = 0
 
+    local function kickAccuracy(cmd)
+        if cmd == "Shoot" then
+            return math.clamp(tonumber(CONFIG.GATE_KICK_ACCURACY) or 0.99, 0, 1)
+        end
+        return math.clamp(tonumber(CONFIG.KICK_ACCURACY) or 1, 0, 1)
+    end
+
+    local function isKickSuccess(res, cmd)
+        if type(res) ~= "table" then return false end
+        if cmd == "Shoot" then
+            if res.Success == true then return true end
+            return type(res.Coins) == "number" and res.Coins > 0
+        end
+        return true
+    end
+
     local function disableGameAutoKick()
-        if not InstancingCmds then return end
+        -- На фазе ворот (Shoot) встроенный авто не мешает — не трогаем
+        if not InstancingCmds or not ZoneProgress.isComplete() then return end
         pcall(InstancingCmds.FireCustom, "Auto", false)
         pcall(InstancingCmds.FireCustom, "AutoThrow", false)
         pcall(InstancingCmds.FireCustom, "SoccerEventAuto", false)
@@ -550,19 +656,27 @@ do
                 task.wait(1.0)
             else
                 disableGameAutoKick()
-                if not ZoneProgress.isComplete() then
+                local gatePhase = not ZoneProgress.isComplete()
+                if gatePhase then
+                    if failStreak >= 2 or ZoneProgress.needReposition(ZoneProgress.getOwnedZone()) then
+                        ZoneProgress.tick(true)
+                    end
+                elseif not ZoneProgress.isComplete() then
                     ZoneProgress.tick()
                 end
                 local cmd = ZoneProgress.getKickCommand()
+                if cmd == "Shoot" then
+                    ZoneProgress.requestBalls()
+                end
                 local ok, res = pcall(InvokeCustom.InvokeServer, InvokeCustom,
-                    "SoccerEvent", cmd, acc)
-                if ok and type(res) == "table" then
+                    "SoccerEvent", cmd, kickAccuracy(cmd))
+                if ok and isKickSuccess(res, cmd) then
                     failStreak = 0
                     Runtime.stats.kicks += 1
-                    if not ZoneProgress.isComplete() then
+                    if gatePhase then
                         ZoneProgress.tryPurchaseNext()
                     end
-                    task.wait(CONFIG.KICK_RATE)
+                    task.wait(gatePhase and (CONFIG.GATE_KICK_RATE or 1.1) or CONFIG.KICK_RATE)
                 else
                     failStreak += 1
                     if failStreak >= (CONFIG.KICK_FAIL_HOP_AFTER or 8) and Ev_MoveServer then
@@ -588,67 +702,239 @@ local EggHatcher = {}
 do
     local cache = {}
     local eggPotatoOn = false
+    local lastPrintEggId = nil
 
-    local function eggTier(info)
-        if not info or not info._id then return 0 end
+    -- Soccer Egg 5 Tier 6 => 506, Soccer Egg 4 => 400 (НЕ Tier-first!)
+    local function eggScore(info)
+        if not info or not info._id then return -1 end
         local id = info._id
-        return tonumber(id:match("Tier (%d+)"))
-            or tonumber(id:match("Egg (%d+)"))
-            or 0
+        if not string.find(id, "Soccer", 1, true) then return -1 end
+        local eggNum = tonumber(id:match("Egg (%d+)")) or 0
+        local tierNum = tonumber(id:match("Tier (%d+)")) or 0
+        return eggNum * 100 + tierNum
     end
 
-    local function getEggInfo(uid)
+    local function getEggInfo(uid, retry)
         if not CustomEggsCmds then return nil end
-        local ok, info = pcall(CustomEggsCmds.Get, uid)
-        if ok and type(info) == "table" then return info end
+        local tries = retry or 1
+        for i = 1, tries do
+            local ok, info = pcall(CustomEggsCmds.Get, uid)
+            if ok and type(info) == "table" and info._id then return info end
+            if i < tries then task.wait(0.15) end
+        end
         return nil
     end
 
-    -- Лучшая будка (глобально или в радиусе).
+    local function isSoccerEgg(info)
+        return info and info._id and string.find(info._id, "Soccer", 1, true) ~= nil
+    end
+
+    local function isBoothInSoccerEvent(center)
+        if not center or not inSoccer() then return false end
+        local inst = getSoccerInstance()
+        if not inst then return false end
+        for _, ch in ipairs(inst:GetChildren()) do
+            if ch.Name:find("Area ") then
+                local p = ch:FindFirstChildWhichIsA("BasePart", true)
+                if p and (center.Position - p.Position).Magnitude < 220 then
+                    return true
+                end
+            end
+        end
+        local teleports = inst:FindFirstChild("Teleports")
+        if teleports then
+            for _, tp in ipairs(teleports:GetChildren()) do
+                local p = tp:IsA("BasePart") and tp or tp:FindFirstChildWhichIsA("BasePart", true)
+                if p and (center.Position - p.Position).Magnitude < 500 then
+                    return true
+                end
+            end
+        end
+        return false
+    end
+
+    local function isEggHatchable(booth, info)
+        if not booth:FindFirstChild("Egg") then return false end
+        if not info or not isSoccerEgg(info) then return false end
+        if inSoccer() and CONFIG.HATCH_INSTANCE_ONLY ~= false then
+            if not isBoothInSoccerEvent(booth:FindFirstChild("Center")) then
+                return false
+            end
+        end
+        if ZoneProgress.isComplete() then return true end
+        if info._dir and EggCmds then
+            local ok, ul = pcall(EggCmds.IsUnlocked, info._dir)
+            if ok and ul == true then return true end
+        end
+        if info._id and EggCmds then
+            local ok, ul = pcall(EggCmds.IsUnlocked, info._id)
+            if ok and ul == true then return true end
+        end
+        return false
+    end
+
+    -- Лучшая будка: максимальный eggScore среди soccer-яиц в инстансе.
     local function findBestBooth()
+        if CONFIG.AUTO_ZONE_PROGRESS and not ZoneProgress.isComplete() then
+            return nil
+        end
         if CONFIG.HATCH_BOOTH_UID then
-            return CONFIG.HATCH_BOOTH_UID, nil
+            local folder = workspace:FindFirstChild("__THINGS")
+            folder = folder and folder:FindFirstChild("CustomEggs")
+            local booth = folder and folder:FindFirstChild(CONFIG.HATCH_BOOTH_UID)
+            return CONFIG.HATCH_BOOTH_UID, booth and booth:FindFirstChild("Center")
         end
         local folder = workspace:FindFirstChild("__THINGS")
         folder = folder and folder:FindFirstChild("CustomEggs")
         if not folder then return nil end
 
         local hrp = getHRP()
-        local bestUID, bestScore, bestDist, bestCenter
-        for _, booth in ipairs(folder:GetChildren()) do
-            local center = booth:FindFirstChild("Center")
-            if booth:FindFirstChild("Egg") and center then
-                local dist = hrp and (center.Position - hrp.Position).Magnitude or 0
-                local inRange = CONFIG.AUTO_TELEPORT_EGG or dist <= CONFIG.HATCH_RANGE
-                if inRange then
-                    local info = getEggInfo(booth.Name)
-                    local tier = eggTier(info)
-                    local pick
-                    if CONFIG.HATCH_BEST_EGG then
-                        pick = tier > (bestScore or -1)
-                            or (tier == (bestScore or -1) and dist < (bestDist or math.huge))
-                    else
-                        pick = not bestDist or dist < bestDist
-                    end
-                    if pick then
-                        bestUID = booth.Name
-                        bestScore = tier
-                        bestDist = dist
-                        bestCenter = center
+        local bestUID, bestCenter
+        local bestScore, bestDist = -1, math.huge
+        local wantMinScore = (ZoneProgress.getOwnedZone() or 0) >= 5 and 501 or 0
+
+        local function consider(booth, center, info, dist)
+            if not isEggHatchable(booth, info) then return end
+            local score = eggScore(info)
+            if score < 0 then return end
+            local pick
+            if CONFIG.HATCH_BEST_EGG then
+                pick = score > bestScore
+                    or (score == bestScore and dist < bestDist)
+            else
+                pick = dist < bestDist
+            end
+            if pick then
+                bestUID = booth.Name
+                bestScore = score
+                bestDist = dist
+                bestCenter = center
+            end
+        end
+
+        local function scanOnce()
+            for _, booth in ipairs(folder:GetChildren()) do
+                local center = booth:FindFirstChild("Center")
+                if booth:FindFirstChild("Egg") and center then
+                    local dist = hrp and (center.Position - hrp.Position).Magnitude or 0
+                    local inRange = CONFIG.AUTO_TELEPORT_EGG or dist <= CONFIG.HATCH_RANGE
+                    if inRange then
+                        consider(booth, center, getEggInfo(booth.Name, 1), dist)
                     end
                 end
             end
         end
-        return bestUID, bestCenter
+
+        scanOnce()
+
+        if wantMinScore > 0 and bestScore > 0 and bestScore < wantMinScore then
+            if not Runtime._eggWaitLogged then
+                Runtime._eggWaitLogged = true
+                print("[SoccerAuto] Жду Egg 5 Tier 3+ (streaming)...")
+            end
+            return nil
+        end
+        Runtime._eggWaitLogged = false
+
+        return bestUID, bestCenter, bestScore
     end
 
-    local function teleportToBestEgg(uid, center)
+    local function getEggTargetZone()
+        local owned = ZoneProgress.getOwnedZone() or 1
+        local maxZ = CONFIG.MAX_SOCCER_ZONE or 5
+        if owned >= maxZ and (ZoneProgress.isComplete() or CONFIG.HATCH_BEST_EGG) then
+            return maxZ
+        end
+        return math.min(math.max(owned, 1), maxZ)
+    end
+
+    local function isNearEggZone(maxDist)
+        local inst = getSoccerInstance()
+        if not inst then return false end
+        local hrp = getHRP()
+        if not hrp then return false end
+        local zone = getEggTargetZone()
+        local area
+        for _, ch in ipairs(inst:GetChildren()) do
+            if ch.Name:find("Area " .. zone) then area = ch break end
+        end
+        area = area or inst:FindFirstChild("5 | Area 5") or inst:FindFirstChild("Common")
+        if not area then return false end
+        local p = area:FindFirstChild("Center", true)
+            or area:FindFirstChild("MainHoop", true)
+            or area:FindFirstChildWhichIsA("BasePart", true)
+        if not p then return false end
+        return (hrp.Position - p.Position).Magnitude <= (maxDist or CONFIG.EGG_ZONE_NEAR_DIST or 180)
+    end
+
+    -- Телепорт к Area 5 только пока будок нет / игрок далеко. Не при каждом fail хэтча.
+    local function needEggZoneTeleport(uid, score)
+        if not CONFIG.AUTO_TELEPORT_EGG or not inSoccer() then return false end
+        local wantMin = (ZoneProgress.getOwnedZone() or 0) >= 5 and 501 or 0
+        if uid and (wantMin <= 0 or (score or 0) >= wantMin) then
+            return false
+        end
+        if isNearEggZone() then return false end
+        return true
+    end
+
+    local function teleportToEggZone(uid, score)
+        if not needEggZoneTeleport(uid, score) then return false end
+        local now = os.clock()
+        local cd = CONFIG.EGG_ZONE_TP_COOLDOWN or 8.0
+        if Runtime._lastEggZoneTp and (now - Runtime._lastEggZoneTp) < cd then
+            return false
+        end
+        local target = getEggTargetZone()
+        local ok = ZoneProgress.teleportToZone(target)
+        if not ok then return false end
+
+        Runtime._lastEggZoneTp = now
+        if not Runtime._eggZoneTpLogged then
+            Runtime._eggZoneTpLogged = true
+            print(("[SoccerAuto] Телепорт к Area %d (прогрузка CustomEggs)..."):format(target))
+        end
+
+        local hrp = getHRP()
+        if hrp and workspace.StreamingEnabled and type(LocalPlayer.RequestStreamAroundAsync) == "function" then
+            pcall(LocalPlayer.RequestStreamAroundAsync, LocalPlayer, hrp.Position)
+        end
+        task.wait(CONFIG.EGG_STREAM_WAIT or 0.35)
+        return true
+    end
+
+    function EggHatcher.teleportToEggZone(uid, score)
+        return teleportToEggZone(uid, score)
+    end
+
+    local function teleportToBestEgg(uid, center, force)
         if not CONFIG.AUTO_TELEPORT_EGG then return end
         local hrp = getHRP()
-        if not hrp or not center then return end
+        if not hrp or not center or not uid then return end
         local dist = (center.Position - hrp.Position).Magnitude
-        if dist <= (CONFIG.TELEPORT_EGG_DIST or 12) then return end
-        teleportToPart(center)
+        local snapDist = CONFIG.TELEPORT_EGG_DIST or 12
+        local hatchRange = CONFIG.HATCH_RANGE or 25
+
+        -- Уже на будке: успешный хэтч + в радиусе сервера — не дёргать CFrame каждый раз
+        if not force and Runtime._latchedBooth == uid and Runtime._latchedHatchOk and dist <= hatchRange then
+            return
+        end
+        if not force and dist <= snapDist then
+            Runtime._latchedBooth = uid
+            return
+        end
+
+        local now = os.clock()
+        local cd = CONFIG.EGG_BOOTH_TP_COOLDOWN or 2.0
+        if not force and Runtime._lastBoothTp and (now - Runtime._lastBoothTp) < cd then
+            return
+        end
+
+        if teleportToPart(center) then
+            Runtime._lastBoothTp = now
+            Runtime._latchedBooth = uid
+            Runtime._latchedHatchOk = false
+        end
     end
 
     local function setEggPotatoMode(on)
@@ -667,95 +953,282 @@ do
         return CONFIG.HATCH_DEFAULT_COUNT or 27
     end
 
-    -- Настройка (best-effort, НЕ блокирует хэтч при неудаче).
+    -- Настройка (best-effort). По умолчанию пропускаем — SetupCustomEgg включает
+    -- "Walk away to stop!" и прячет Main; CustomEggs_Hatch работает без setup.
     local function ensureSetup(uid, info, count)
         local c = cache[uid]
         if c and c.setupDone then return end
-        if Hatching and info and info._dir then
-            pcall(Hatching.SetupCustomEgg, uid, info._dir, count)
-            if AutoHatchEnable and info._id then
-                pcall(AutoHatchEnable.FireServer, AutoHatchEnable, info._id, count)
+        if not CONFIG.HATCH_SKIP_SETUP then
+            if Hatching and info and info._dir then
+                pcall(Hatching.SetupCustomEgg, uid, info._dir, count)
+                if AutoHatchEnable and info._id then
+                    pcall(AutoHatchEnable.FireServer, AutoHatchEnable, info._id, count)
+                end
             end
         end
         cache[uid] = { count = count, setupDone = true }
-        print(("[SoccerAuto] Хэтч-цель: %s x%d (будка %s)")
-            :format((info and info._id) or "?", count, uid:sub(1, 8)))
-    end
-
-    -- скрыть оверлей "Click to open!" + держать выключенным.
-    -- Переустанавливаем коннект, если GUI пересоздан (новый сервер/респавн).
-    local function hideRevealGui()
-        if not CONFIG.HATCH_HIDE_GUI then return end
-        local pg = LocalPlayer:FindFirstChild("PlayerGui")
-        if not pg then return end
-        local eoa = pg:FindFirstChild("EggOpenAnimation")
-        if not eoa or not eoa:IsA("ScreenGui") then return end
-
-        if eoa.Enabled then pcall(function() eoa.Enabled = false end) end
-
-        -- если коннект мёртв или к старому объекту — пересоздаём
-        if Runtime._eoa ~= eoa then
-            if Runtime._eoaConn then pcall(function() Runtime._eoaConn:Disconnect() end) end
-            Runtime._eoa = eoa
-            Runtime._eoaConn = track(eoa:GetPropertyChangedSignal("Enabled"):Connect(function()
-                if Runtime.running and CONFIG.HATCH_HIDE_GUI and eoa.Enabled then
-                    pcall(function() eoa.Enabled = false end)
-                end
-            end))
+        local eggId = info and info._id
+        if eggId and eggId ~= lastPrintEggId then
+            lastPrintEggId = eggId
+            print(("[SoccerAuto] Хэтч-цель: %s x%d (score=%d, будка %s)")
+                :format(eggId, count, eggScore(info), uid:sub(1, 8)))
         end
     end
 
-    -- единичная попытка хэтча (без анимации). true при успехе.
-    local function hatchOnce()
-        if not CustomEggsHatch then return false end
+    local HATCH_OVERLAY_NAMES = {
+        TapToOpen = true, Reveal = true, CustomEggOpen = true,
+        EggReveal = true, PetReveal = true, Overlay = true,
+        WalkAway = true, Blackout = true, Blur = true,
+    }
 
-        local uid, center = findBestBooth()
-        if not uid then return false end
+    local SOCCER_UI_GUIS = { "YeetMain", "GoalsSide", "ProgressBars" }
+    local HUB_UI_GUIS    = { "Main", "MainLeft" }
+
+    local function getGuardGuis()
+        if inSoccer() then return SOCCER_UI_GUIS end
+        local t = {}
+        for _, n in ipairs(HUB_UI_GUIS) do t[#t + 1] = n end
+        for _, n in ipairs(SOCCER_UI_GUIS) do t[#t + 1] = n end
+        return t
+    end
+
+    local function ensureMainUiVisible()
+        local pg = LocalPlayer:FindFirstChild("PlayerGui")
+        if not pg then return end
+        for _, name in ipairs(getGuardGuis()) do
+            local g = pg:FindFirstChild(name)
+            if g and g:IsA("ScreenGui") and not g.Enabled then
+                pcall(function() g.Enabled = true end)
+            end
+        end
+    end
+
+    local function clearCameraHatchVfx()
+        if not CONFIG.HATCH_HIDE_GUI then return end
+        local cam = workspace.CurrentCamera
+        if not cam then return end
+        for _, name in ipairs({ "Eggs", "Pets", "EggOpenLight" }) do
+            local c = cam:FindFirstChild(name)
+            if c then pcall(c.Destroy, c) end
+        end
+    end
+
+    local function cameraHasHatchVfx()
+        local cam = workspace.CurrentCamera
+        if not cam then return false end
+        return cam:FindFirstChild("Eggs")
+            or cam:FindFirstChild("Pets")
+            or cam:FindFirstChild("EggOpenLight")
+    end
+
+    local function suppressHatchOverlays()
+        if not CONFIG.HATCH_HIDE_GUI then return end
+        ensureMainUiVisible()
+
+        local pg = LocalPlayer:FindFirstChild("PlayerGui")
+        if not pg then return end
+
+        local eoa = pg:FindFirstChild("EggOpenAnimation")
+        if eoa and eoa.Enabled then
+            Runtime._eoaDisabledByUs = true
+            pcall(function() eoa.Enabled = false end)
+        end
+        if eoa then
+            for _, ch in ipairs(eoa:GetChildren()) do
+                if ch:IsA("GuiObject") and HATCH_OVERLAY_NAMES[ch.Name] then
+                    pcall(function() ch.Visible = false end)
+                end
+            end
+        end
+    end
+
+    local function startHatchSuppress(sec)
+        Runtime._hatchSuppressUntil = os.clock() + (sec or CONFIG.HATCH_SUPPRESS_SEC or 4)
+    end
+
+    local function finishHatchVisuals()
+        if not CONFIG.HATCH_HIDE_GUI then return end
+        startHatchSuppress(CONFIG.HATCH_SUPPRESS_SEC or 4)
+        clearCameraHatchVfx()
+        suppressHatchOverlays()
+        if Hatching and type(Hatching.StopHatching) == "function" then
+            pcall(Hatching.StopHatching)
+        end
+    end
+
+    function EggHatcher.setupAnimBlocker()
+        if Runtime._animBlockSetup then return end
+        Runtime._animBlockSetup = true
+        local net = Network:FindFirstChild("Eggs_PlayOpenAnimation")
+        if not net then return end
+        local function blockHandlers()
+            if type(getconnections) ~= "function" then return end
+            local ok, list = pcall(getconnections, net.OnClientEvent)
+            if not ok or type(list) ~= "table" then return end
+            for _, c in ipairs(list) do
+                if c and type(c.Disable) == "function" then
+                    pcall(c.Disable, c)
+                end
+            end
+        end
+        blockHandlers()
+        spawnLoop("animBlock", function()
+            if Runtime.running and CONFIG.HATCH_HIDE_GUI and inSoccer() then
+                blockHandlers()
+            end
+            task.wait(8)
+        end)
+    end
+
+    function EggHatcher.setupMainUiGuard()
+        if Runtime._hatchUiConn or not CONFIG.HATCH_HIDE_GUI then return end
+        EggHatcher.setupAnimBlocker()
+        local RS = game:GetService("RunService")
+        Runtime._hatchUiConn = track(RS.RenderStepped:Connect(function()
+            if not Runtime.running or not CONFIG.HATCH_HIDE_GUI then return end
+            if not inSoccer() then return end
+
+            ensureMainUiVisible()
+
+            local untilT = Runtime._hatchSuppressUntil
+            local vfx = cameraHasHatchVfx()
+            if vfx then
+                Runtime._hatchSuppressUntil = math.max(untilT or 0, os.clock() + 1)
+            end
+            if (untilT and os.clock() < untilT) or vfx then
+                clearCameraHatchVfx()
+                suppressHatchOverlays()
+            elseif Runtime._eoaDisabledByUs then
+                local pg = LocalPlayer:FindFirstChild("PlayerGui")
+                local eoa = pg and pg:FindFirstChild("EggOpenAnimation")
+                if eoa then pcall(function() eoa.Enabled = true end) end
+                Runtime._eoaDisabledByUs = false
+            end
+        end))
+        Runtime._mainUiGuard = true
+    end
+
+    function EggHatcher.prestreamEggs()
+        if not inSoccer() then return end
+        teleportToEggZone(nil, nil)
+        if not workspace.StreamingEnabled then return end
+        local inst = getSoccerInstance()
+        if not inst then return end
+        local zone = getEggTargetZone()
+        local area = inst:FindFirstChild(tostring(zone) .. " | Area " .. zone)
+            or inst:FindFirstChild("5 | Area 5")
+            or inst:FindFirstChild("Common")
+        local p = area and area:FindFirstChildWhichIsA("BasePart", true)
+        if p and type(LocalPlayer.RequestStreamAroundAsync) == "function" then
+            pcall(LocalPlayer.RequestStreamAroundAsync, LocalPlayer, p.Position)
+        end
+    end
+
+    function EggHatcher.setupVfxBlocker()
+        if not CONFIG.HATCH_HIDE_GUI or Runtime._hatchCamConn then return end
+        local cam = workspace.CurrentCamera
+        if not cam then return end
+        Runtime._hatchCamConn = track(cam.ChildAdded:Connect(function(ch)
+            if not Runtime.running or not CONFIG.HATCH_HIDE_GUI then return end
+            if ch.Name == "Eggs" or ch.Name == "Pets" or ch.Name == "EggOpenLight" then
+                task.defer(function()
+                    if ch.Parent then pcall(ch.Destroy, ch) end
+                end)
+            end
+        end))
+    end
+
+    local function hatchOnce(uid, center)
+        if not CustomEggsHatch or not uid then return false end
 
         teleportToBestEgg(uid, center)
         setEggPotatoMode(true)
 
-        local info = getEggInfo(uid)
-        -- даже если info=nil (не успело прогрузиться) — всё равно пробуем хэтч,
-        -- т.к. чистый CustomEggs_Hatch(uid, count) работает без setup (проверено).
+        local info = getEggInfo(uid, 2)
         local count = (cache[uid] and cache[uid].count) or resolveCount(info)
 
         if not (cache[uid] and cache[uid].setupDone) then
             ensureSetup(uid, info, count)
         end
 
-        -- ОБХОД "Click to open!": НЕ зовём AttemptHatch (это анимация-ревил).
         if not CONFIG.HATCH_SKIP_ANIM and Hatching then
             pcall(Hatching.AttemptHatch)
         end
 
         local ok, res = pcall(CustomEggsHatch.InvokeServer, CustomEggsHatch, uid, count)
-        if ok and res == true then
+        if CONFIG.HATCH_HIDE_GUI then
+            finishHatchVisuals()
+        end
+        if ok and res ~= false and res ~= nil then
             Runtime.stats.hatches += 1
+            Runtime._eggWaitLogged = false
+            Runtime._latchedBooth = uid
+            Runtime._latchedHatchOk = true
             return true
+        end
+        if center and getHRP() then
+            local dist = (center.Position - getHRP().Position).Magnitude
+            if dist > (CONFIG.HATCH_RANGE or 25) then
+                Runtime._latchedHatchOk = false
+            end
         end
         return false
     end
 
+    -- "ok" | "no_booth" | "hatch_fail" | "idle" | "zones"
+    local function hatchTick()
+        if not inSoccer() then return "idle" end
+        if CONFIG.AUTO_ZONE_PROGRESS and not ZoneProgress.isComplete() then return "zones" end
+
+        local uid, center, score = findBestBooth()
+        if uid and uid ~= Runtime._latchedBooth then
+            Runtime._latchedHatchOk = false
+        end
+        if not uid and needEggZoneTeleport(nil, nil) then
+            if teleportToEggZone(nil, nil) then
+                uid, center, score = findBestBooth()
+            end
+        end
+        if not uid then return "no_booth" end
+
+        if hatchOnce(uid, center) then return "ok" end
+        return "hatch_fail"
+    end
+
     -- отдельный поток: InvokeServer сам держит темп (~серверный debounce 1.6с)
     function EggHatcher.run()
-        local lastHide = 0
+        EggHatcher.setupVfxBlocker()
+        EggHatcher.setupMainUiGuard()
+        if needEggZoneTeleport(nil, nil) then
+            EggHatcher.prestreamEggs()
+        end
+        local missStream = 0
         while Runtime.running do
-            -- периодически переустанавливаем скрытие оверлея (на случай пересоздания GUI)
-            local now = os.clock()
-            if (now - lastHide) >= 1.0 then
-                lastHide = now
-                hideRevealGui()
-            end
-
             if inSoccer() then
-                local ok = hatchOnce()
-                if not ok then
+                if CONFIG.AUTO_ZONE_PROGRESS and not ZoneProgress.isComplete() then
                     task.wait(CONFIG.HATCH_RETRY)
+                else
+                    local status = hatchTick()
+                    if status == "ok" then
+                        missStream = 0
+                    elseif status == "no_booth" then
+                        missStream += 1
+                        if missStream == 1 or missStream == 12 then
+                            EggHatcher.prestreamEggs()
+                        end
+                        local wantMin = (ZoneProgress.getOwnedZone() or 0) >= 5 and 501 or 0
+                        local waitT = (wantMin > 0 and missStream <= 12)
+                            and (CONFIG.HATCH_WAIT_BEST or 0.4) or CONFIG.HATCH_RETRY
+                        task.wait(waitT)
+                    elseif status == "hatch_fail" then
+                        task.wait(CONFIG.HATCH_RETRY)
+                    else
+                        task.wait(CONFIG.HATCH_RETRY)
+                    end
                 end
-                -- при успехе НЕ ждём: следующий InvokeServer заблокируется до
-                -- ответа сервера, что и даёт естественный темп без перегруза.
             else
+                missStream = 0
+                Runtime._eggZoneTpLogged = false
                 task.wait(1.0)
             end
         end
@@ -763,6 +1236,9 @@ do
 
     function EggHatcher.reset()
         table.clear(cache)
+        lastPrintEggId = nil
+        Runtime._latchedBooth = nil
+        Runtime._latchedHatchOk = false
     end
 end
 
@@ -983,20 +1459,25 @@ local function setupAutoRejoin()
         local path = CONFIG.SCRIPT_PATH
         local code
 
-        if type(url) == "string" and url ~= "" then
+        if type(readfile) == "function" and type(isfile) == "function"
+            and isfile(path) then
+            code = ([[
+local function loadLocal(p)
+    if isfile and isfile(p) then loadstring(readfile(p))() end
+end
+loadLocal("bootstrap.lua")
+loadLocal("%s")
+]]):format(path:gsub("\\", "\\\\"))
+            pcall(queue_on_teleport, code)
+            print("[SoccerAuto] Авто-перезапуск после телепорта настроен (локальные файлы).")
+        elseif type(url) == "string" and url ~= "" then
             local base = CONFIG.GITHUB_BASE or url:gsub("/soccer_auto%.lua$", "")
             code = ([[
 loadstring(game:HttpGet("%s/bootstrap.lua"))()
 loadstring(game:HttpGet("%s/soccer_auto.lua"))()
 ]]):format(base, base)
             pcall(queue_on_teleport, code)
-            print("[SoccerAuto] Авто-перезапуск после телепорта настроен (GitHub + bootstrap).")
-        elseif type(readfile) == "function" and type(isfile) == "function"
-            and isfile(path) then
-            code = ("local s='%s' if isfile and isfile(s) then loadstring(readfile(s))() end")
-                :format(path)
-            pcall(queue_on_teleport, code)
-            print("[SoccerAuto] Авто-перезапуск после телепорта настроен (файл).")
+            print("[SoccerAuto] Авто-перезапуск после телепорта настроен (GitHub).")
         else
             print(("[SoccerAuto] Для авто-перезапуска укажи GITHUB_RAW_URL или сохрани скрипт как '%s'."):format(path))
         end
@@ -1129,11 +1610,40 @@ function App.Stop()
     if not Runtime.running then return end
     Runtime.running = false
     for _, c in ipairs(Runtime.connections) do
-        pcall(function() c:Disconnect() end)
+        if c and type(c.Disconnect) == "function" then
+            pcall(c.Disconnect, c)
+        end
     end
     table.clear(Runtime.connections)
+    Runtime._hatchUiConn = nil
+    Runtime._mainUiGuard = nil
+    Runtime._animBlockSetup = nil
     restoreOptimization()
     print("[SoccerAuto] Остановлено и очищено.")
+end
+
+function App.EnableKickHook()
+    if getgenv().__KickHook then
+        print("[SoccerAuto] Kick-hook уже активен → getgenv().__KickHook.Log()")
+        return getgenv().__KickHookLog
+    end
+    local ok, src = pcall(readfile, "kick_hook.lua")
+    if ok and type(src) == "string" then
+        local fn = loadstring(src)
+        if fn then pcall(fn) end
+    else
+        warn("[SoccerAuto] Положи kick_hook.lua рядом со скриптом или выполни его вручную.")
+    end
+    return getgenv().__KickHookLog
+end
+
+function App.DisableKickHook()
+    local kh = getgenv().__KickHook
+    if kh and kh.Stop then pcall(kh.Stop) end
+    if getgenv().__SoccerKickHookRestore then
+        pcall(getgenv().__SoccerKickHookRestore)
+        getgenv().__SoccerKickHookRestore = nil
+    end
 end
 
 function App.Status()
@@ -1160,7 +1670,7 @@ end
 ----------------------------------------------------------------
 -- ЗАПУСК
 ----------------------------------------------------------------
-print(("[SoccerAuto] v5 старт | executor=%s"):format(tostring(U.identify())))
+print(("[SoccerAuto] v5.12 старт | executor=%s"):format(tostring(U.identify())))
 
 ensureInSoccer()
 if CONFIG.COLLECT_ORBS then safe("orbListeners", OrbCollector.setupListeners) end
