@@ -1,6 +1,6 @@
 --[[
     ================================================================
-       SOCCER EVENT AUTO  v5.13  —  Pet Sim 99 / Soccer Event
+       SOCCER EVENT AUTO  v5.14  —  Pet Sim 99 / Soccer Event
     ================================================================
     Полностью исследовано вживую через Roblox MCP (placeId 8737899170,
     executor Volt 1.2.24.3). Все механики подтверждены на реальной игре.
@@ -14,7 +14,7 @@
         (server-side, не конфликтует с киком). Стой на яйце — скрипт держит
         авто-хэтч включённым.
       • Умные апгрейды: тратит SoccerOrbs по приоритету (доход / 100% крит).
-      • Авто-экип лучших питомцев: PetCmds.EquipBest + авто-экип игры для новых.
+      • Авто-экип лучших питомцев: топ из GetSortedPets (сила на карточке), не LD_BestFit.
       • Анти-АФК: VirtualUser + Players.Idled (проверено).
       • Оптимизация игры (обратимая): FPS-cap, отключение пост-эффектов,
         понижение качества рендера.
@@ -40,7 +40,7 @@ local CONFIG = {
     AUTO_KICK    = true,   -- кастомный быстрый кик (InfiniteShoot)
     AUTO_HATCH   = true,   -- авто-открытие кастом-яйца (CustomEggs_Hatch)
     AUTO_UPGRADE = true,
-    AUTO_EQUIP_PETS = true,  -- PetCmds.EquipBest (лучшие по урону/силе)
+    AUTO_EQUIP_PETS = true,  -- топ-N из PetCmds.GetSortedPets (сила на карточке)
     ANTI_AFK     = true,
     OPTIMIZE_GAME = true,  -- обратимая оптимизация графики
 
@@ -60,10 +60,12 @@ local CONFIG = {
     UPGRADE_INTERVAL = 2.0,
     ORB_RESERVE      = 0,
 
-    -- Экип питомцев (PetCmds.EquipBest → Pets_EquipBest LD_BestFit)
-    EQUIP_BEST_INTERVAL = 30,   -- периодический пересчёт лучшего экипа (сек)
-    EQUIP_BEST_COOLDOWN = 8,    -- мин. пауза между вызовами EquipBest (сек)
-    EQUIP_ENSURE_AUTO   = true, -- включить встроенный авто-экип игры (новые петы)
+    -- Экип питомцев (GetSortedPets = сортировка как в инвентаре по силе)
+    EQUIP_MODE = "sorted",       -- "sorted" = топ GetSortedPets; "bestfit" = EquipBest/LD_BestFit
+    EQUIP_BEST_INTERVAL = 30,    -- периодический пересчёт (сек)
+    EQUIP_BEST_COOLDOWN = 8,     -- мин. пауза между полными пере-экипами (сек)
+    EQUIP_ENSURE_AUTO   = true,  -- авто-экип игры для новых петов
+    EQUIP_DISABLE_FAVORITE = true, -- выключить режим «только избранные»
     PRIORITIZE_100_PERCENT = false, -- сперва Critical+Trickshot до 100%
     UPGRADE_PRIORITY = {
         "SoccerYeetOrbStrength", "SoccerYeetOrbsReach", "SoccerBetterYeetEgg",
@@ -1339,12 +1341,15 @@ do
 end
 
 ----------------------------------------------------------------
--- 4b) АВТО-ЭКИП ЛУЧШИХ ПИТОМЦЕВ  (PetCmds.EquipBest — проверено MCP)
+-- 4b) АВТО-ЭКИП ЛУЧШИХ ПИТОМЦЕВ
+-- GetSortedPets = та же сортировка, что «сила» в инвентаре (300k > 80k).
+-- EquipBest/LD_BestFit иногда одевает слабых (стacks/best-fit) — опционально.
 ----------------------------------------------------------------
 local PetEquip = {}
 do
     local lastEquipAt = 0
     local lastEquippedN = -1
+    local lastTopUid = nil
 
     local function countEquipped()
         if not PetCmds then return 0 end
@@ -1359,6 +1364,29 @@ do
         return (ok and type(n) == "number") and n or 0
     end
 
+    local function getSortedPets()
+        if not PetCmds then return nil end
+        local ok, list = pcall(PetCmds.GetSortedPets)
+        return (ok and type(list) == "table") and list or nil
+    end
+
+    local function petUid(p)
+        if not p or type(p.GetUID) ~= "function" then return nil end
+        local ok, uid = pcall(p.GetUID, p)
+        return ok and uid or nil
+    end
+
+    local function equippedUidSet()
+        local set = {}
+        local ok, items = pcall(PetCmds.GetEquippedItems)
+        if not ok or type(items) ~= "table" then return set end
+        for _, p in ipairs(items) do
+            local uid = petUid(p)
+            if uid then set[uid] = true end
+        end
+        return set
+    end
+
     local function ensureGameAutoEquip()
         if not CONFIG.EQUIP_ENSURE_AUTO or not PetCmds then return end
         local ok, on = pcall(PetCmds.IsAutoEquipEnabled)
@@ -1367,7 +1395,17 @@ do
         end
     end
 
-    local function fireEquipBest()
+    local function disableFavoriteOnly()
+        if not CONFIG.EQUIP_DISABLE_FAVORITE or not PetCmds then return end
+        if type(PetCmds.IsFavoriteModeEnabled) ~= "function" then return end
+        if type(PetCmds.ToggleFavoriteMode) ~= "function" then return end
+        local ok, on = pcall(PetCmds.IsFavoriteModeEnabled)
+        if ok and on == true then
+            pcall(PetCmds.ToggleFavoriteMode)
+        end
+    end
+
+    local function fireEquipBestFit()
         if PetCmds and type(PetCmds.EquipBest) == "function" then
             local ok = pcall(PetCmds.EquipBest)
             if ok then return true end
@@ -1378,29 +1416,78 @@ do
         return false
     end
 
+    local function needsReequip(sorted, max, force)
+        if force then return true end
+        if not sorted or #sorted == 0 then return false end
+        local targetN = math.min(max, #sorted)
+        local n = countEquipped()
+        if n < targetN then return true end
+        local topUid = petUid(sorted[1])
+        if topUid and topUid ~= lastTopUid then return true end
+        if topUid then
+            local eq = equippedUidSet()
+            if not eq[topUid] then return true end
+        end
+        return false
+    end
+
+    local function equipTopSorted(max)
+        local sorted = getSortedPets()
+        if not sorted or #sorted == 0 then return false, 0 end
+        local targetN = math.min(max, #sorted)
+        pcall(PetCmds.UnequipAll)
+        task.wait(0.12)
+        local n = 0
+        for i = 1, targetN do
+            local uid = petUid(sorted[i])
+            if uid and pcall(PetCmds.Equip, uid) then
+                n += 1
+            end
+        end
+        lastTopUid = petUid(sorted[1])
+        return n > 0, n
+    end
+
     function PetEquip.tick(force)
         if not CONFIG.AUTO_EQUIP_PETS or not PetCmds then return end
         local now = os.clock()
         local cd = CONFIG.EQUIP_BEST_COOLDOWN or 8
         if not force and (now - lastEquipAt) < cd then return end
 
-        if not force then
+        local max = maxSlots()
+        if max <= 0 then return end
+
+        disableFavoriteOnly()
+        ensureGameAutoEquip()
+
+        local mode = CONFIG.EQUIP_MODE or "sorted"
+        local sorted = getSortedPets()
+        if mode == "sorted" and not needsReequip(sorted, max, force) then
+            return
+        end
+        if mode ~= "sorted" and not force then
             local ok, maxed = pcall(PetCmds.IsMaxEquipped)
             if ok and maxed == true then return end
         end
 
-        ensureGameAutoEquip()
         local before = countEquipped()
-        if not fireEquipBest() then return end
+        local okEquip = false
+        if mode == "bestfit" then
+            okEquip = fireEquipBestFit()
+        else
+            okEquip = select(1, equipTopSorted(max))
+        end
+        if not okEquip then return end
         lastEquipAt = now
 
         task.defer(function()
-            task.wait(0.35)
+            task.wait(0.45)
             local after = countEquipped()
-            local max = maxSlots()
             if after ~= lastEquippedN or (force and after ~= before) then
                 lastEquippedN = after
-                print(("[SoccerAuto] Экип лучших питомцев: %d/%d"):format(after, max))
+                local topName = sorted and sorted[1] and sorted[1].GetName and sorted[1]:GetName() or "?"
+                print(("[SoccerAuto] Экип топ-петов (%s): %d/%d | лучший: %s")
+                    :format(mode, after, max, topName))
             end
         end)
     end
@@ -1763,7 +1850,7 @@ end
 ----------------------------------------------------------------
 -- ЗАПУСК
 ----------------------------------------------------------------
-print(("[SoccerAuto] v5.13 старт | executor=%s"):format(tostring(U.identify())))
+print(("[SoccerAuto] v5.14 старт | executor=%s"):format(tostring(U.identify())))
 
 ensureInSoccer()
 if CONFIG.AUTO_EQUIP_PETS then
