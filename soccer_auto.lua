@@ -1,6 +1,6 @@
 --[[
     ================================================================
-       SOCCER EVENT AUTO  v5.22  —  Pet Sim 99 / Soccer Event
+       SOCCER EVENT AUTO  v5.23  —  Pet Sim 99 / Soccer Event
     ================================================================
     Полностью исследовано вживую через Roblox MCP (placeId 8737899170,
     executor Volt 1.2.24.3). Все механики подтверждены на реальной игре.
@@ -111,6 +111,8 @@ local CONFIG = {
     KICK_BROKEN_HOP_AFTER = 1,   -- hop после N ServerModule-ошибок подряд
     KICK_REJOIN_BEFORE_HOP = false, -- rejoin SoccerEvent перед hop (обычно бесполезен)
     KICK_RECOVERY_COOLDOWN = 45, -- пауза между циклами восстановления (сек)
+    KICK_WARMUP_SEC     = 12,    -- не считать ServerModule-fail до стабилизации после старта/hop
+    ENTER_RETRY_COOLDOWN = 10,   -- пауза между попытками Enter SoccerEvent (сек)
 
     -- Доп. клеймы / бусты (проверено через MCP)
     AUTO_FREE_GIFTS    = true,  -- Redeem Free Gift 1..12 по Save.FreeGiftsRedeemed
@@ -407,6 +409,7 @@ end
 
 local function hardReloadSoccerAuto(reason)
     if ENV.__SoccerAuto_GEN ~= GEN then return false end
+    ENV.__SoccerAuto_LAST_RELOAD = os.clock()
     print(("[SoccerAuto] Hard reload (%s)…"):format(tostring(reason or "?")))
     Runtime.running = false
     for _, c in ipairs(Runtime.connections) do
@@ -428,7 +431,6 @@ local function hopToNewServer(reason)
     if hopInProgress or not Ev_MoveServer then return end
     hopInProgress = true
     kickRecoveryLock = true
-    queueScriptRestart()
     local jobBefore = game.JobId
     print(("[SoccerAuto] Hop на другой сервер (%s)…"):format(tostring(reason or "?")))
     Runtime.running = false
@@ -438,8 +440,10 @@ local function hopToNewServer(reason)
             task.wait(1)
             if ENV.__SoccerAuto_GEN ~= GEN then return end
             if game.JobId ~= jobBefore then
-                task.wait(6)
-                hardReloadSoccerAuto("hop")
+                task.wait(5)
+                if ENV.__SoccerAuto_GEN == GEN then
+                    hardReloadSoccerAuto("hop")
+                end
                 return
             end
         end
@@ -459,17 +463,61 @@ local function getSave()
     return ok and s or nil
 end
 
+local lastEnterAttempt = 0
+local enterFailStreak = 0
+local lastEnterFailLog = 0
+
+local function hasCharacter()
+    local char = LocalPlayer.Character
+    return char and char:FindFirstChild("HumanoidRootPart") ~= nil
+end
+
+local function pastKickWarmup()
+    return (os.clock() - (Runtime._startedAt or 0)) >= (CONFIG.KICK_WARMUP_SEC or 12)
+end
+
 local function ensureInSoccer()
-    if not CONFIG.AUTO_ENTER or not InstancingCmds then return end
-    if inSoccer() then return end
-    local ok = pcall(InstancingCmds.Enter, "SoccerEvent")
-    if ok then
+    if not CONFIG.AUTO_ENTER or not InstancingCmds then return false end
+    if inRecovery() then return false end
+    if inSoccer() then
+        enterFailStreak = 0
+        return true
+    end
+    if not hasCharacter() then return false end
+    local now = os.clock()
+    if (now - lastEnterAttempt) < (CONFIG.ENTER_RETRY_COOLDOWN or 10) then
+        return false
+    end
+    lastEnterAttempt = now
+    pcall(InstancingCmds.Enter, "SoccerEvent")
+    task.wait(1.5)
+    if inSoccer() then
+        enterFailStreak = 0
         print("[SoccerAuto] Авто-вход в SoccerEvent.")
         task.defer(function()
             task.wait(2)
-            requestKickBalls()
+            if alive() then requestKickBalls() end
         end)
+        return true
     end
+    enterFailStreak += 1
+    if enterFailStreak == 1 or (now - lastEnterFailLog) >= 30 then
+        lastEnterFailLog = now
+        warn(("[SoccerAuto] Вход в SoccerEvent не удался (попытка %d) — ждём…"):format(enterFailStreak))
+    end
+    return false
+end
+
+local function startEnterLoop()
+    if not CONFIG.AUTO_ENTER then return end
+    task.spawn(function()
+        for _ = 1, 90 do
+            if not alive() or inRecovery() then return end
+            if inSoccer() then return end
+            if hasCharacter() then ensureInSoccer() end
+            task.wait(CONFIG.ENTER_RETRY_COOLDOWN or 10)
+        end
+    end)
 end
 
 local lastInstanceRejoin = 0
@@ -523,6 +571,7 @@ end
 
 local function recoverBrokenKick(reason)
     if kickRecoveryLock then return false end
+    if not pastKickWarmup() and not inSoccer() then return false end
     local now = os.clock()
     if (now - lastKickRecovery) < (CONFIG.KICK_RECOVERY_COOLDOWN or 45) then return false end
     kickRecoveryLock = true
@@ -880,7 +929,7 @@ do
             if not alive() then return end
             if inSoccer() then break end
             ensureInSoccer()
-            task.wait(0.5)
+            task.wait(2.0)
         end
         disableGameAutoKick()
 
@@ -889,7 +938,7 @@ do
                 task.wait(1.0)
             elseif not inSoccer() then
                 ensureInSoccer()
-                task.wait(1.0)
+                task.wait(CONFIG.ENTER_RETRY_COOLDOWN or 10)
             elseif not isPlaying() then
                 if not wasPaused then
                     wasPaused = true
@@ -941,18 +990,22 @@ do
                     else
                         failStreak += 1
                         if isBrokenServerKick(ok, res) then
-                            brokenKickStreak += 1
-                            local now = os.clock()
-                            if (now - lastFailLog) >= 8 then
-                                lastFailLog = now
-                                print(("[SoccerAuto] Сервер кика сломан (%s) | broken=%d")
-                                    :format(cmd, brokenKickStreak))
-                            end
-                            if brokenKickStreak >= (CONFIG.KICK_BROKEN_HOP_AFTER or 2) then
-                                recoverBrokenKick("ServerModule")
-                                task.wait(5.0)
-                            else
+                            if not pastKickWarmup() or not inSoccer() then
                                 task.wait(1.5)
+                            else
+                                brokenKickStreak += 1
+                                local now = os.clock()
+                                if (now - lastFailLog) >= 8 then
+                                    lastFailLog = now
+                                    print(("[SoccerAuto] Сервер кика сломан (%s) | broken=%d")
+                                        :format(cmd, brokenKickStreak))
+                                end
+                                if brokenKickStreak >= (CONFIG.KICK_BROKEN_HOP_AFTER or 2) then
+                                    recoverBrokenKick("ServerModule")
+                                    task.wait(5.0)
+                                else
+                                    task.wait(1.5)
+                                end
                             end
                         else
                             local now = os.clock()
@@ -1858,11 +1911,17 @@ local function setupSessionWatchdog()
         if not alive() then return end
         local jid = game.JobId
         if Runtime._watchJobId and jid ~= Runtime._watchJobId then
-            print("[SoccerAuto] Смена сервера — hard reload…")
             Runtime._watchJobId = jid
-            queueScriptRestart()
-            task.wait(6)
-            hardReloadSoccerAuto("jobId")
+            if not hopInProgress then
+                local sinceReload = os.clock() - (ENV.__SoccerAuto_LAST_RELOAD or 0)
+                if sinceReload > 20 then
+                    print("[SoccerAuto] Смена сервера — hard reload…")
+                    task.wait(5)
+                    if ENV.__SoccerAuto_GEN == GEN then
+                        hardReloadSoccerAuto("jobId")
+                    end
+                end
+            end
             return
         end
         Runtime._watchJobId = jid
@@ -2061,13 +2120,13 @@ end
 ----------------------------------------------------------------
 -- ЗАПУСК
 ----------------------------------------------------------------
-print(("[SoccerAuto] v5.22 старт | gen=%d executor=%s"):format(GEN, tostring(U.identify())))
+print(("[SoccerAuto] v5.23 старт | gen=%d executor=%s"):format(GEN, tostring(U.identify())))
 
-ensureInSoccer()
+startEnterLoop()
 if CONFIG.AUTO_KICK then
     task.defer(function()
         task.wait(8)
-        if not alive() or inRecovery() or not inSoccer() or not isPlaying() then return end
+        if not alive() or inRecovery() or not pastKickWarmup() or not inSoccer() or not isPlaying() then return end
         safe("kickProbe", function()
             if not probeKickWorks() then recoverBrokenKick("startup") end
         end)
