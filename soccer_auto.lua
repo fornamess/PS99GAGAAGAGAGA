@@ -1,6 +1,6 @@
 --[[
     ================================================================
-       SOCCER EVENT AUTO  v5.19  —  Pet Sim 99 / Soccer Event
+       SOCCER EVENT AUTO  v5.20  —  Pet Sim 99 / Soccer Event
     ================================================================
     Полностью исследовано вживую через Roblox MCP (placeId 8737899170,
     executor Volt 1.2.24.3). Все механики подтверждены на реальной игре.
@@ -45,7 +45,7 @@ local CONFIG = {
     OPTIMIZE_GAME = true,  -- обратимая оптимизация графики
 
     -- Кик
-    KICK_ACCURACY = 1.0,   -- InfiniteShoot (endgame)
+    KICK_ACCURACY = 0.98,  -- InfiniteShoot (игра шлёт 0.98–0.99)
     GATE_KICK_ACCURACY = 0.99, -- Shoot по воротам — игра шлёт 0.98–0.99 (хук)
     KICK_RATE     = 3.05,  -- пауза между киками InfiniteShoot (сек). Guard = 3с.
     GATE_KICK_RATE = 2.5,  -- пауза между ударами по воротам (Shoot)
@@ -105,10 +105,9 @@ local CONFIG = {
     AUTO_ZONE_PROGRESS  = true,  -- авто-прогрессия зон 1→5 (Shoot + покупка зон)
     MAX_SOCCER_ZONE     = 5,
 
-    -- Кик: recovery при сломанном инстансе (ServerModule nil — Leave+Enter, потом hop)
-    KICK_INSTANCE_REJOIN_AFTER = 4, -- перезаход в SoccerEvent после N ServerModule-ошибок
-    KICK_FAIL_HOP       = true,  -- hop если после rejoin всё ещё fail
-    KICK_FAIL_HOP_AFTER = 12,
+    -- Кик: ServerModule-ошибка = сломанный сервер (rejoin не помогает — только hop)
+    KICK_BROKEN_HOP_AFTER = 2,   -- hop после N ServerModule-ошибок подряд
+    KICK_RECOVERY_COOLDOWN = 45, -- пауза между циклами восстановления (сек)
 
     -- Доп. клеймы / бусты (проверено через MCP)
     AUTO_FREE_GIFTS    = true,  -- Redeem Free Gift 1..12 по Save.FreeGiftsRedeemed
@@ -189,6 +188,25 @@ if type(ENV.__SoccerAuto) == "table" and type(ENV.__SoccerAuto.Stop) == "functio
     pcall(ENV.__SoccerAuto.Stop)
     task.wait(0.2)
 end
+-- всегда перезаписываем queue_on_teleport (убирает старый loader с WaitForChild-ошибкой)
+if CONFIG.QUEUE_ON_TELEPORT and type(queue_on_teleport) == "function" then
+    task.defer(function()
+        task.wait(0.1)
+        pcall(function()
+            local base = CONFIG.GITHUB_BASE or ""
+            if base ~= "" then
+                local code = ([=[task.spawn(function()
+for _=1,180 do if game:IsLoaded() then local rs=game:GetService("ReplicatedStorage") if rs and rs:FindFirstChild("Network") then break end end task.wait(1) end
+local rs=game:GetService("ReplicatedStorage") if not rs or not rs:FindFirstChild("Network") then return end
+local b="%s"
+pcall(function() loadstring(game:HttpGet(b.."/bootstrap.lua"),"bootstrap")() end)
+pcall(function() loadstring(game:HttpGet(b.."/soccer_auto.lua"),"soccer_auto")() end)
+end)]=]):format(base)
+                pcall(queue_on_teleport, code)
+            end
+        end)
+    end)
+end
 
 local U = {
     getgc        = (getgc),
@@ -217,6 +235,7 @@ local Runtime = {
     connections = {},
     restore = {},          -- что откатить при Stop
     stats = { kicks = 0, orbs = 0, upgrades = 0, hatches = 0, claims = 0, errors = 0 },
+    _startedAt = os.clock(),
 }
 ENV.__SoccerAuto = App
 
@@ -333,6 +352,7 @@ local function requestKickBalls()
 end
 
 -- Перезапуск после hop/телепорта (Move Server не всегда триггерит queue_on_teleport)
+local QUEUE_LOADER_V = 3
 local function buildQueueLoader()
     local base = CONFIG.GITHUB_BASE or ""
     if base == "" then
@@ -341,31 +361,21 @@ local function buildQueueLoader()
     end
     local path = CONFIG.SCRIPT_PATH or "soccer_auto.lua"
     if type(readfile) == "function" and type(isfile) == "function" and isfile(path) then
-        return ([=[
-pcall(function()
-repeat task.wait() until game:IsLoaded()
-local rs = game:GetService("ReplicatedStorage")
-if not rs then return end
-rs:WaitForChild("Network", 120)
-local function loadLocal(p)
-    if isfile and isfile(p) then loadstring(readfile(p), p)() end
-end
-loadLocal("bootstrap.lua")
-loadLocal("%s")
-end)
-]=]):format(path:gsub("\\", "\\\\"))
+        return ([=[task.spawn(function()
+for _=1,180 do if game:IsLoaded() then local rs=game:GetService("ReplicatedStorage") if rs and rs:FindFirstChild("Network") then break end end task.wait(1) end
+local rs=game:GetService("ReplicatedStorage") if not rs or not rs:FindFirstChild("Network") then return end
+local function loadLocal(p) if isfile and isfile(p) then pcall(function() loadstring(readfile(p),p)() end) end end
+loadLocal("bootstrap.lua") loadLocal("%s")
+end)]=]):format(path:gsub("\\", "\\\\"))
     end
     if base ~= "" then
-        return ([=[
-pcall(function()
-repeat task.wait() until game:IsLoaded()
-local rs = game:GetService("ReplicatedStorage")
-if not rs then return end
-rs:WaitForChild("Network", 120)
-loadstring(game:HttpGet("%s/bootstrap.lua"), "bootstrap")()
-loadstring(game:HttpGet("%s/soccer_auto.lua"), "soccer_auto")()
-end)
-]=]):format(base, base)
+        return ([=[task.spawn(function()
+for _=1,180 do if game:IsLoaded() then local rs=game:GetService("ReplicatedStorage") if rs and rs:FindFirstChild("Network") then break end end task.wait(1) end
+local rs=game:GetService("ReplicatedStorage") if not rs or not rs:FindFirstChild("Network") then return end
+local b="%s"
+pcall(function() loadstring(game:HttpGet(b.."/bootstrap.lua"),"bootstrap")() end)
+pcall(function() loadstring(game:HttpGet(b.."/soccer_auto.lua"),"soccer_auto")() end)
+end)]=]):format(base)
     end
     return nil
 end
@@ -374,13 +384,13 @@ local function queueScriptRestart()
     if not CONFIG.QUEUE_ON_TELEPORT or type(queue_on_teleport) ~= "function" then return false end
     local code = buildQueueLoader()
     if not code then return false end
+    ENV.__PS99_QUEUE_V = QUEUE_LOADER_V
+    ENV.__PS99_QUEUE_CODE = code
     return pcall(queue_on_teleport, code)
 end
 
 local function reloadSoccerAutoFromSource()
-    local code = buildQueueLoader()
-    if not code then return false end
-    local fn = loadstring(code)
+    local fn = loadstring(buildQueueLoader() or "")
     if not fn then return false end
     return pcall(fn)
 end
@@ -394,10 +404,10 @@ local function hopToNewServer(reason)
     print(("[SoccerAuto] Hop на другой сервер (%s)…"):format(tostring(reason or "?")))
     pcall(Ev_MoveServer.FireServer, Ev_MoveServer)
     task.spawn(function()
-        for _ = 1, 90 do
+        for _ = 1, 120 do
             task.wait(1)
             if game.JobId ~= jobBefore then
-                task.wait(4)
+                task.wait(6)
                 reloadSoccerAutoFromSource()
                 break
             end
@@ -450,6 +460,53 @@ local function isBrokenServerKick(ok, res)
     local s = tostring(res)
     return s:find("ServerModule", 1, true) ~= nil
         or s:find("INSTANCE_UNREPLICATED", 1, true) ~= nil
+end
+
+local function isKickSuccess(res, cmd)
+    if type(res) ~= "table" then return false end
+    if res.Success == true then return true end
+    return type(res.Coins) == "number" and res.Coins > 0
+end
+
+local brokenKickStreak = 0
+local kickRecoveryLock = false
+local lastKickRecovery = 0
+
+local function probeKickWorks()
+    if not InvokeCustom or not isPlaying() then return true end
+    if InstancingCmds and InstancingCmds.InvokeCustom then
+        pcall(InstancingCmds.InvokeCustom, "SoccerEvent", "JoinRound")
+    end
+    requestKickBalls()
+    task.wait(0.15)
+    local ok, res = pcall(InvokeCustom.InvokeServer, InvokeCustom,
+        "SoccerEvent", "InfiniteShoot", CONFIG.KICK_ACCURACY or 0.98)
+    if ok and (res == nil or isKickSuccess(res, "InfiniteShoot")) then return true end
+    return not isBrokenServerKick(ok, res)
+end
+
+local function recoverBrokenKick(reason)
+    if kickRecoveryLock then return false end
+    local now = os.clock()
+    if (now - lastKickRecovery) < (CONFIG.KICK_RECOVERY_COOLDOWN or 45) then return false end
+    kickRecoveryLock = true
+    lastKickRecovery = now
+    print(("[SoccerAuto] Сломанный сервер кика (%s) — восстановление…"):format(tostring(reason or "?")))
+
+    rejoinSoccerInstance()
+    task.wait(1.5)
+    if probeKickWorks() then
+        print("[SoccerAuto] Кик восстановлен после rejoin.")
+        brokenKickStreak = 0
+        kickRecoveryLock = false
+        return true
+    end
+
+    print("[SoccerAuto] Rejoin не помог — hop на другой сервер…")
+    hopToNewServer("broken kick")
+    brokenKickStreak = 0
+    kickRecoveryLock = false
+    return false
 end
 
 ----------------------------------------------------------------
@@ -752,20 +809,10 @@ do
         if cmd == "Shoot" then
             return math.clamp(tonumber(CONFIG.GATE_KICK_ACCURACY) or 0.99, 0, 1)
         end
-        return math.clamp(tonumber(CONFIG.KICK_ACCURACY) or 1, 0, 1)
-    end
-
-    local function isKickSuccess(res, cmd)
-        if type(res) ~= "table" then return false end
-        if res.Success == true then return true end
-        if cmd == "Shoot" then
-            return type(res.Coins) == "number" and res.Coins > 0
-        end
-        return type(res.Coins) == "number" and res.Coins > 0
+        return math.clamp(tonumber(CONFIG.KICK_ACCURACY) or 0.98, 0, 1)
     end
 
     local function disableGameAutoKick()
-        -- На фазе ворот (Shoot) встроенный авто не мешает — не трогаем
         if not InstancingCmds or not ZoneProgress.isComplete() then return end
         pcall(InstancingCmds.FireCustom, "Auto", false)
         pcall(InstancingCmds.FireCustom, "AutoThrow", false)
@@ -774,6 +821,7 @@ do
 
     function Kicker.resetFails()
         failStreak = 0
+        brokenKickStreak = 0
     end
 
     function Kicker.run()
@@ -786,7 +834,9 @@ do
         disableGameAutoKick()
 
         while Runtime.running do
-            if not inSoccer() then
+            if kickRecoveryLock then
+                task.wait(1.0)
+            elseif not inSoccer() then
                 ensureInSoccer()
                 task.wait(1.0)
             elseif not isPlaying() then
@@ -804,57 +854,66 @@ do
                 end
                 if not InvokeCustom then
                     task.wait(1.0)
+                elseif brokenKickStreak >= (CONFIG.KICK_BROKEN_HOP_AFTER or 2) then
+                    recoverBrokenKick("streak")
+                    task.wait(5.0)
                 else
-                disableGameAutoKick()
-                local gatePhase = not ZoneProgress.isComplete()
-                if gatePhase then
-                    if failStreak >= 2 or ZoneProgress.needReposition(ZoneProgress.getOwnedZone()) then
-                        ZoneProgress.tick(true)
-                    end
-                elseif not ZoneProgress.isComplete() then
-                    ZoneProgress.tick()
-                end
-                local cmd = ZoneProgress.getKickCommand()
-                requestKickBalls()
-                if cmd == "Shoot" then
-                    task.wait(0.08)
-                end
-                local ok, res = pcall(InvokeCustom.InvokeServer, InvokeCustom,
-                    "SoccerEvent", cmd, kickAccuracy(cmd))
-                if ok and res == nil then
-                    -- серверный cooldown (guard ~3с), не считаем fail
-                    task.wait(CONFIG.KICK_RATE)
-                elseif ok and isKickSuccess(res, cmd) then
-                    failStreak = 0
-                    Runtime.stats.kicks += 1
+                    disableGameAutoKick()
+                    local gatePhase = not ZoneProgress.isComplete()
                     if gatePhase then
-                        ZoneProgress.tryPurchaseNext()
+                        if failStreak >= 2 or ZoneProgress.needReposition(ZoneProgress.getOwnedZone()) then
+                            ZoneProgress.tick(true)
+                        end
+                    elseif not ZoneProgress.isComplete() then
+                        ZoneProgress.tick()
                     end
-                    task.wait(gatePhase and (CONFIG.GATE_KICK_RATE or 1.1) or CONFIG.KICK_RATE)
-                else
-                    failStreak += 1
-                    local now = os.clock()
-                    if (now - lastFailLog) >= 8 then
-                        lastFailLog = now
-                        local resInfo = type(res) == "table" and "table" or tostring(res)
-                        print(("[SoccerAuto] Кик отклонён (%s): ok=%s res=%s | streak=%d")
-                            :format(cmd, tostring(ok), resInfo, failStreak))
+                    if InstancingCmds and InstancingCmds.InvokeCustom then
+                        pcall(InstancingCmds.InvokeCustom, "SoccerEvent", "JoinRound")
                     end
-                    local rejoinAfter = CONFIG.KICK_INSTANCE_REJOIN_AFTER or 4
-                    if isBrokenServerKick(ok, res) and failStreak >= rejoinAfter then
-                        if rejoinSoccerInstance() then
-                            failStreak = 0
+                    local cmd = ZoneProgress.getKickCommand()
+                    requestKickBalls()
+                    if cmd == "Shoot" then
+                        task.wait(0.08)
+                    end
+                    local ok, res = pcall(InvokeCustom.InvokeServer, InvokeCustom,
+                        "SoccerEvent", cmd, kickAccuracy(cmd))
+                    if ok and res == nil then
+                        task.wait(CONFIG.KICK_RATE)
+                    elseif ok and isKickSuccess(res, cmd) then
+                        failStreak = 0
+                        brokenKickStreak = 0
+                        Runtime.stats.kicks += 1
+                        if gatePhase then
+                            ZoneProgress.tryPurchaseNext()
+                        end
+                        task.wait(gatePhase and (CONFIG.GATE_KICK_RATE or 1.1) or CONFIG.KICK_RATE)
+                    else
+                        failStreak += 1
+                        if isBrokenServerKick(ok, res) then
+                            brokenKickStreak += 1
+                            local now = os.clock()
+                            if (now - lastFailLog) >= 8 then
+                                lastFailLog = now
+                                print(("[SoccerAuto] Сервер кика сломан (%s) | broken=%d")
+                                    :format(cmd, brokenKickStreak))
+                            end
+                            if brokenKickStreak >= (CONFIG.KICK_BROKEN_HOP_AFTER or 2) then
+                                recoverBrokenKick("ServerModule")
+                                task.wait(5.0)
+                            else
+                                task.wait(1.5)
+                            end
+                        else
+                            local now = os.clock()
+                            if (now - lastFailLog) >= 8 then
+                                lastFailLog = now
+                                local resInfo = type(res) == "table" and "table" or tostring(res)
+                                print(("[SoccerAuto] Кик отклонён (%s): ok=%s res=%s | streak=%d")
+                                    :format(cmd, tostring(ok), resInfo, failStreak))
+                            end
+                            task.wait(CONFIG.KICK_BACKOFF)
                         end
                     end
-                    local hopAfter = CONFIG.KICK_FAIL_HOP_AFTER or 0
-                    if CONFIG.KICK_FAIL_HOP and hopAfter > 0 and failStreak >= hopAfter then
-                        failStreak = 0
-                        hopToNewServer("кик fail")
-                        task.wait(5.0)
-                        ensureInSoccer()
-                    end
-                    task.wait(CONFIG.KICK_BACKOFF)
-                end
                 end
             end
         end
@@ -1728,13 +1787,43 @@ local function setupAutoRejoin()
             end)
         end
         track(GuiService.ErrorMessageChanged:Connect(function(msg)
-            if Runtime.running and type(msg) == "string" and msg ~= "" then
-                task.wait(1)
+            if not Runtime.running or type(msg) ~= "string" or msg == "" then return end
+            local low = string.lower(msg)
+            if low:find("disconnect", 1, true) or low:find("connection", 1, true)
+                or low:find("reconnect", 1, true) or low:find("lost", 1, true) then
+                task.wait(2)
                 rejoin()
             end
         end))
         print("[SoccerAuto] Авто-реджойн при дисконнекте активен.")
     end
+end
+
+local function setupSessionWatchdog()
+    Runtime._watchJobId = game.JobId
+    spawnLoop("watchdog", function()
+        if not Runtime.running then return end
+        local jid = game.JobId
+        if Runtime._watchJobId and jid ~= Runtime._watchJobId then
+            print("[SoccerAuto] Смена сервера — перезапуск скрипта…")
+            Runtime._watchJobId = jid
+            queueScriptRestart()
+            task.wait(6)
+            if Runtime.running then
+                reloadSoccerAutoFromSource()
+            end
+            return
+        end
+        Runtime._watchJobId = jid
+        if CONFIG.AUTO_KICK and inSoccer() and isPlaying() and not kickRecoveryLock
+            and brokenKickStreak == 0 and (Runtime.stats.kicks or 0) == 0 then
+            local age = os.clock() - (Runtime._startedAt or 0)
+            if age > 90 and not probeKickWorks() then
+                recoverBrokenKick("watchdog")
+            end
+        end
+        task.wait(15)
+    end)
 end
 
 ----------------------------------------------------------------
@@ -1916,9 +2005,17 @@ end
 ----------------------------------------------------------------
 -- ЗАПУСК
 ----------------------------------------------------------------
-print(("[SoccerAuto] v5.19 старт | executor=%s"):format(tostring(U.identify())))
+print(("[SoccerAuto] v5.20 старт | executor=%s"):format(tostring(U.identify())))
 
 ensureInSoccer()
+if CONFIG.AUTO_KICK then
+    task.defer(function()
+        task.wait(8)
+        if Runtime.running and inSoccer() and isPlaying() and not probeKickWorks() then
+            recoverBrokenKick("startup")
+        end
+    end)
+end
 if CONFIG.AUTO_EQUIP_PETS then
     task.defer(function()
         task.wait(2)
@@ -1939,6 +2036,7 @@ end
 if CONFIG.OPTIMIZE_GAME then safe("optimize", applyOptimization) end
 if CONFIG.ANTI_AFK then safe("antiafk", setupAntiAFK) end
 if CONFIG.AUTO_REJOIN or CONFIG.QUEUE_ON_TELEPORT then safe("autorejoin", setupAutoRejoin) end
+safe("watchdog", setupSessionWatchdog)
 safe("maint", setupMaintenanceLoops)
 
 -- Поток авто-клеймов (низкая частота)
