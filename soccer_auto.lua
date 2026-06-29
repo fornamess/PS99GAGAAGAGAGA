@@ -1,6 +1,6 @@
 --[[
     ================================================================
-       SOCCER EVENT AUTO  v5.20  —  Pet Sim 99 / Soccer Event
+       SOCCER EVENT AUTO  v5.22  —  Pet Sim 99 / Soccer Event
     ================================================================
     Полностью исследовано вживую через Roblox MCP (placeId 8737899170,
     executor Volt 1.2.24.3). Все механики подтверждены на реальной игре.
@@ -21,7 +21,9 @@
 
     ОПТИМИЗАЦИЯ САМОГО СКРИПТА
       • Чистый перезапуск: повторный запуск гасит прошлый экземпляр
-        (нет утечки потоков/коннектов).
+        (нет утечки потоков/коннектов). Поколение __SoccerAuto_GEN —
+        защита от двойных инстансов после hop/reload.
+      • Hard reload после hop: Stop → loadstring (не вложенный task.spawn).
       • Кик вынесен в отдельный поток (Invoke yield не стопорит сбор орбов).
       • Горячие пути без аллокаций замыканий (pcall(fn, args)).
       • Централизованная обработка ошибок с rate-limit (нет спама).
@@ -106,7 +108,8 @@ local CONFIG = {
     MAX_SOCCER_ZONE     = 5,
 
     -- Кик: ServerModule-ошибка = сломанный сервер (rejoin не помогает — только hop)
-    KICK_BROKEN_HOP_AFTER = 2,   -- hop после N ServerModule-ошибок подряд
+    KICK_BROKEN_HOP_AFTER = 1,   -- hop после N ServerModule-ошибок подряд
+    KICK_REJOIN_BEFORE_HOP = false, -- rejoin SoccerEvent перед hop (обычно бесполезен)
     KICK_RECOVERY_COOLDOWN = 45, -- пауза между циклами восстановления (сек)
 
     -- Доп. клеймы / бусты (проверено через MCP)
@@ -183,30 +186,14 @@ end
 ----------------------------------------------------------------
 local ENV = (getgenv and getgenv()) or _G
 
--- Чистый перезапуск: гасим прошлый экземпляр (защита от утечек).
+-- Чистый перезапуск: гасим прошлый экземпляр (защита от двойных инстансов).
 if type(ENV.__SoccerAuto) == "table" and type(ENV.__SoccerAuto.Stop) == "function" then
-    pcall(ENV.__SoccerAuto.Stop)
-    task.wait(0.2)
+    pcall(function() ENV.__SoccerAuto.Stop(true) end)
+    task.wait(0.25)
 end
--- всегда перезаписываем queue_on_teleport (убирает старый loader с WaitForChild-ошибкой)
-if CONFIG.QUEUE_ON_TELEPORT and type(queue_on_teleport) == "function" then
-    task.defer(function()
-        task.wait(0.1)
-        pcall(function()
-            local base = CONFIG.GITHUB_BASE or ""
-            if base ~= "" then
-                local code = ([=[task.spawn(function()
-for _=1,180 do if game:IsLoaded() then local rs=game:GetService("ReplicatedStorage") if rs and rs:FindFirstChild("Network") then break end end task.wait(1) end
-local rs=game:GetService("ReplicatedStorage") if not rs or not rs:FindFirstChild("Network") then return end
-local b="%s"
-pcall(function() loadstring(game:HttpGet(b.."/bootstrap.lua"),"bootstrap")() end)
-pcall(function() loadstring(game:HttpGet(b.."/soccer_auto.lua"),"soccer_auto")() end)
-end)]=]):format(base)
-                pcall(queue_on_teleport, code)
-            end
-        end)
-    end)
-end
+ENV.__SoccerAuto_GEN = (ENV.__SoccerAuto_GEN or 0) + 1
+local GEN = ENV.__SoccerAuto_GEN
+if type(clearteleportqueue) == "function" then pcall(clearteleportqueue) end
 
 local U = {
     getgc        = (getgc),
@@ -239,6 +226,10 @@ local Runtime = {
 }
 ENV.__SoccerAuto = App
 
+local function alive()
+    return Runtime.running and ENV.__SoccerAuto_GEN == GEN
+end
+
 local function track(conn) Runtime.connections[#Runtime.connections + 1] = conn return conn end
 
 -- rate-limited обработчик ошибок (без спама в консоль)
@@ -258,7 +249,7 @@ end
 
 local function spawnLoop(name, body)
     task.spawn(function()
-        while Runtime.running do
+        while alive() do
             body()
         end
     end)
@@ -274,25 +265,35 @@ end
 -- ссылки на игру
 ----------------------------------------------------------------
 repeat task.wait() until game:IsLoaded()
-ReplicatedStorage:WaitForChild("Network", 120)
 
-local Library = ReplicatedStorage:WaitForChild("Library", 30)
-local Network = ReplicatedStorage:WaitForChild("Network", 30)
+local function waitChild(parent, name, timeoutSec)
+    if not parent then return nil end
+    local limit = timeoutSec or 30
+    for _ = 1, limit do
+        local c = parent:FindFirstChild(name)
+        if c then return c end
+        task.wait(1)
+    end
+    return parent:FindFirstChild(name)
+end
+
+local Network = waitChild(ReplicatedStorage, "Network", 120)
+local Library = waitChild(ReplicatedStorage, "Library", 30)
 if not Library or not Network then
     warn("[SoccerAuto] Не найден Library/Network — не та игра?")
     return
 end
 
-local FireCustom   = Network:WaitForChild("Instancing_FireCustomFromClient", 30)
-local InvokeCustom = Network:WaitForChild("Instancing_InvokeCustomFromClient", 30)
-local CustomEggsHatch = Network:WaitForChild("CustomEggs_Hatch", 30)
+local FireCustom   = waitChild(Network, "Instancing_FireCustomFromClient", 30)
+local InvokeCustom = waitChild(Network, "Instancing_InvokeCustomFromClient", 30)
+local CustomEggsHatch = waitChild(Network, "CustomEggs_Hatch", 30)
 local AutoHatchEnable = Network:FindFirstChild("AutoHatch_Enable")
 if not InvokeCustom then
     warn("[SoccerAuto] Instancing_InvokeCustomFromClient не найден — кик отключён.")
     CONFIG.AUTO_KICK = false
 end
 
-local Client = Library:WaitForChild("Client", 10)
+local Client = waitChild(Library, "Client", 10)
 local InstancingCmds   = safeRequire(Client:FindFirstChild("InstancingCmds"))
 local InstanceZoneCmds = safeRequire(Client:FindFirstChild("InstanceZoneCmds"))
 local EventUpgradeCmds = safeRequire(Client:FindFirstChild("EventUpgradeCmds"))
@@ -352,7 +353,10 @@ local function requestKickBalls()
 end
 
 -- Перезапуск после hop/телепорта (Move Server не всегда триггерит queue_on_teleport)
-local QUEUE_LOADER_V = 3
+local QUEUE_LOADER_V = 4
+local QUEUE_STOP = [[pcall(function() local g=getgenv and getgenv()or _G if type(g.__SoccerAuto)=="table"and type(g.__SoccerAuto.Stop)=="function"then g.__SoccerAuto.Stop(true)end end) task.wait(0.35) ]]
+local QUEUE_WAIT = [[for _=1,180 do if game:IsLoaded() then local rs=game:GetService("ReplicatedStorage") if rs and rs:FindFirstChild("Network") then break end end task.wait(1) end local rs=game:GetService("ReplicatedStorage") if not rs or not rs:FindFirstChild("Network") then return end ]]
+
 local function buildQueueLoader()
     local base = CONFIG.GITHUB_BASE or ""
     if base == "" then
@@ -361,21 +365,10 @@ local function buildQueueLoader()
     end
     local path = CONFIG.SCRIPT_PATH or "soccer_auto.lua"
     if type(readfile) == "function" and type(isfile) == "function" and isfile(path) then
-        return ([=[task.spawn(function()
-for _=1,180 do if game:IsLoaded() then local rs=game:GetService("ReplicatedStorage") if rs and rs:FindFirstChild("Network") then break end end task.wait(1) end
-local rs=game:GetService("ReplicatedStorage") if not rs or not rs:FindFirstChild("Network") then return end
-local function loadLocal(p) if isfile and isfile(p) then pcall(function() loadstring(readfile(p),p)() end) end end
-loadLocal("bootstrap.lua") loadLocal("%s")
-end)]=]):format(path:gsub("\\", "\\\\"))
+        return QUEUE_STOP .. QUEUE_WAIT .. ([[local function loadLocal(p) if isfile and isfile(p) then pcall(function() loadstring(readfile(p),p)() end) end end loadLocal("bootstrap.lua") loadLocal("%s")]]):format(path:gsub("\\", "\\\\"))
     end
     if base ~= "" then
-        return ([=[task.spawn(function()
-for _=1,180 do if game:IsLoaded() then local rs=game:GetService("ReplicatedStorage") if rs and rs:FindFirstChild("Network") then break end end task.wait(1) end
-local rs=game:GetService("ReplicatedStorage") if not rs or not rs:FindFirstChild("Network") then return end
-local b="%s"
-pcall(function() loadstring(game:HttpGet(b.."/bootstrap.lua"),"bootstrap")() end)
-pcall(function() loadstring(game:HttpGet(b.."/soccer_auto.lua"),"soccer_auto")() end)
-end)]=]):format(base)
+        return QUEUE_STOP .. QUEUE_WAIT .. ([[local b="%s" pcall(function() loadstring(game:HttpGet(b.."/bootstrap.lua"),"bootstrap")() end) pcall(function() loadstring(game:HttpGet(b.."/soccer_auto.lua"),"soccer_auto")() end)]]):format(base)
     end
     return nil
 end
@@ -384,36 +377,80 @@ local function queueScriptRestart()
     if not CONFIG.QUEUE_ON_TELEPORT or type(queue_on_teleport) ~= "function" then return false end
     local code = buildQueueLoader()
     if not code then return false end
+    if type(clearteleportqueue) == "function" then pcall(clearteleportqueue) end
     ENV.__PS99_QUEUE_V = QUEUE_LOADER_V
     ENV.__PS99_QUEUE_CODE = code
     return pcall(queue_on_teleport, code)
 end
 
-local function reloadSoccerAutoFromSource()
-    local fn = loadstring(buildQueueLoader() or "")
-    if not fn then return false end
-    return pcall(fn)
+local function loadScriptFromSource()
+    local path = CONFIG.SCRIPT_PATH or "soccer_auto.lua"
+    if type(readfile) == "function" and type(isfile) == "function" and isfile(path) then
+        if isfile("bootstrap.lua") then
+            pcall(function() loadstring(readfile("bootstrap.lua"), "bootstrap")() end)
+        end
+        pcall(function() loadstring(readfile(path), path)() end)
+        return true
+    end
+    local base = CONFIG.GITHUB_BASE or ""
+    if base == "" then
+        local url = CONFIG.GITHUB_RAW_URL or ""
+        base = url:gsub("/soccer_auto%.lua$", "")
+    end
+    if base ~= "" and game.HttpGet then
+        pcall(function() loadstring(game:HttpGet(base .. "/bootstrap.lua"), "bootstrap")() end)
+        pcall(function() loadstring(game:HttpGet(base .. "/soccer_auto.lua"), "soccer_auto")() end)
+        return true
+    end
+    return false
+end
+
+local function hardReloadSoccerAuto(reason)
+    if ENV.__SoccerAuto_GEN ~= GEN then return false end
+    print(("[SoccerAuto] Hard reload (%s)…"):format(tostring(reason or "?")))
+    Runtime.running = false
+    for _, c in ipairs(Runtime.connections) do
+        if c and type(c.Disconnect) == "function" then pcall(c.Disconnect, c) end
+    end
+    table.clear(Runtime.connections)
+    task.wait(0.35)
+    return loadScriptFromSource()
 end
 
 local hopInProgress = false
+local kickRecoveryLock = false
+
+local function inRecovery()
+    return kickRecoveryLock or hopInProgress
+end
+
 local function hopToNewServer(reason)
     if hopInProgress or not Ev_MoveServer then return end
     hopInProgress = true
+    kickRecoveryLock = true
     queueScriptRestart()
     local jobBefore = game.JobId
     print(("[SoccerAuto] Hop на другой сервер (%s)…"):format(tostring(reason or "?")))
+    Runtime.running = false
     pcall(Ev_MoveServer.FireServer, Ev_MoveServer)
     task.spawn(function()
         for _ = 1, 120 do
             task.wait(1)
+            if ENV.__SoccerAuto_GEN ~= GEN then return end
             if game.JobId ~= jobBefore then
                 task.wait(6)
-                reloadSoccerAutoFromSource()
-                break
+                hardReloadSoccerAuto("hop")
+                return
             end
         end
         hopInProgress = false
+        kickRecoveryLock = false
+        warn("[SoccerAuto] Hop не удался — JobId не сменился.")
     end)
+end
+
+if CONFIG.QUEUE_ON_TELEPORT and type(queue_on_teleport) == "function" then
+    queueScriptRestart()
 end
 
 local function getSave()
@@ -469,7 +506,6 @@ local function isKickSuccess(res, cmd)
 end
 
 local brokenKickStreak = 0
-local kickRecoveryLock = false
 local lastKickRecovery = 0
 
 local function probeKickWorks()
@@ -493,19 +529,21 @@ local function recoverBrokenKick(reason)
     lastKickRecovery = now
     print(("[SoccerAuto] Сломанный сервер кика (%s) — восстановление…"):format(tostring(reason or "?")))
 
-    rejoinSoccerInstance()
-    task.wait(1.5)
-    if probeKickWorks() then
-        print("[SoccerAuto] Кик восстановлен после rejoin.")
-        brokenKickStreak = 0
-        kickRecoveryLock = false
-        return true
+    if CONFIG.KICK_REJOIN_BEFORE_HOP then
+        rejoinSoccerInstance()
+        task.wait(1.5)
+        if probeKickWorks() then
+            print("[SoccerAuto] Кик восстановлен после rejoin.")
+            brokenKickStreak = 0
+            kickRecoveryLock = false
+            return true
+        end
+        print("[SoccerAuto] Rejoin не помог — hop на другой сервер…")
+    else
+        print("[SoccerAuto] Hop на другой сервер (rejoin пропущен)…")
     end
 
-    print("[SoccerAuto] Rejoin не помог — hop на другой сервер…")
     hopToNewServer("broken kick")
-    brokenKickStreak = 0
-    kickRecoveryLock = false
     return false
 end
 
@@ -554,6 +592,7 @@ do
 
     function ZoneProgress.isComplete()
         if not CONFIG.AUTO_ZONE_PROGRESS or not InstanceZoneCmds then return true end
+        if inRecovery() then return true end
         local mz = maxZone()
         local ok, unlocked = pcall(InstanceZoneCmds.IsUnlocked, mz)
         if ok and unlocked == true then return true end
@@ -771,28 +810,40 @@ do
     end
 
     function OrbCollector.tick()
+        if inRecovery() then return 0 end
         local reg = getRegistry()
         if not reg then
             findAccessor()
             return 0
         end
-        local n = 0
-        for key, orb in pairs(reg) do
-            if isOrbEntry(orb) then
-                local uid = rawget(orb, "UID")
-                pcall(FireCustom.FireServer, FireCustom, "SoccerEvent", "ClaimOrb", uid)
-                if CONFIG.DESTROY_MODEL then
-                    local model = rawget(orb, "Model")
-                    if typeof(model) == "Instance" then
-                        pcall(model.Destroy, model)
-                    end
-                end
-                rawset(reg, key, nil)
-                Runtime.stats.orbs += 1
-                n += 1
-            end
+        if type(reg) ~= "table" then
+            OrbCollector.reset()
+            return 0
         end
-        return n
+        local ok, n = pcall(function()
+            local count = 0
+            for key, orb in pairs(reg) do
+                if isOrbEntry(orb) then
+                    local uid = rawget(orb, "UID")
+                    pcall(FireCustom.FireServer, FireCustom, "SoccerEvent", "ClaimOrb", uid)
+                    if CONFIG.DESTROY_MODEL then
+                        local model = rawget(orb, "Model")
+                        if typeof(model) == "Instance" then
+                            pcall(model.Destroy, model)
+                        end
+                    end
+                    rawset(reg, key, nil)
+                    Runtime.stats.orbs += 1
+                    count += 1
+                end
+            end
+            return count
+        end)
+        if not ok then
+            OrbCollector.reset()
+            return 0
+        end
+        return type(n) == "number" and n or 0
     end
 end
 
@@ -826,14 +877,14 @@ do
 
     function Kicker.run()
         for _ = 1, 12 do
-            if not Runtime.running then return end
+            if not alive() then return end
             if inSoccer() then break end
             ensureInSoccer()
             task.wait(0.5)
         end
         disableGameAutoKick()
 
-        while Runtime.running do
+        while alive() do
             if kickRecoveryLock then
                 task.wait(1.0)
             elseif not inSoccer() then
@@ -1384,7 +1435,7 @@ do
         end
         blockHandlers()
         spawnLoop("animBlock", function()
-            if Runtime.running and CONFIG.HATCH_HIDE_GUI and inSoccer() then
+            if alive() and CONFIG.HATCH_HIDE_GUI and inSoccer() then
                 blockHandlers()
             end
             task.wait(8)
@@ -1396,7 +1447,7 @@ do
         EggHatcher.setupAnimBlocker()
         local RS = game:GetService("RunService")
         Runtime._hatchUiConn = track(RS.RenderStepped:Connect(function()
-            if not Runtime.running or not CONFIG.HATCH_HIDE_GUI then return end
+            if not alive() or not CONFIG.HATCH_HIDE_GUI then return end
             if not inSoccer() then return end
 
             ensureMainUiVisible()
@@ -1440,7 +1491,7 @@ do
         local cam = workspace.CurrentCamera
         if not cam then return end
         Runtime._hatchCamConn = track(cam.ChildAdded:Connect(function(ch)
-            if not Runtime.running or not CONFIG.HATCH_HIDE_GUI then return end
+            if not alive() or not CONFIG.HATCH_HIDE_GUI then return end
             if ch.Name == "Eggs" or ch.Name == "Pets" or ch.Name == "EggOpenLight" then
                 task.defer(function()
                     if ch.Parent then pcall(ch.Destroy, ch) end
@@ -1518,8 +1569,10 @@ do
             EggHatcher.prestreamEggs()
         end
         local missStream = 0
-        while Runtime.running do
-            if inSoccer() then
+        while alive() do
+            if inRecovery() then
+                task.wait(1.0)
+            elseif inSoccer() then
                 if CONFIG.AUTO_ZONE_PROGRESS and not ZoneProgress.isComplete() then
                     task.wait(CONFIG.HATCH_RETRY)
                 else
@@ -1599,7 +1652,7 @@ do
     end
 
     function Upgrades.tick()
-        if not EventUpgradeCmds or not inSoccer() then return end
+        if inRecovery() or not EventUpgradeCmds or not inSoccer() then return end
         local budget = orbs() - CONFIG.ORB_RESERVE
         local priority = CONFIG.PRIORITIZE_100_PERCENT
             and CONFIG.UPGRADE_PRIORITY_100 or CONFIG.UPGRADE_PRIORITY
@@ -1787,7 +1840,7 @@ local function setupAutoRejoin()
             end)
         end
         track(GuiService.ErrorMessageChanged:Connect(function(msg)
-            if not Runtime.running or type(msg) ~= "string" or msg == "" then return end
+            if not alive() or type(msg) ~= "string" or msg == "" then return end
             local low = string.lower(msg)
             if low:find("disconnect", 1, true) or low:find("connection", 1, true)
                 or low:find("reconnect", 1, true) or low:find("lost", 1, true) then
@@ -1802,16 +1855,14 @@ end
 local function setupSessionWatchdog()
     Runtime._watchJobId = game.JobId
     spawnLoop("watchdog", function()
-        if not Runtime.running then return end
+        if not alive() then return end
         local jid = game.JobId
         if Runtime._watchJobId and jid ~= Runtime._watchJobId then
-            print("[SoccerAuto] Смена сервера — перезапуск скрипта…")
+            print("[SoccerAuto] Смена сервера — hard reload…")
             Runtime._watchJobId = jid
             queueScriptRestart()
             task.wait(6)
-            if Runtime.running then
-                reloadSoccerAutoFromSource()
-            end
+            hardReloadSoccerAuto("jobId")
             return
         end
         Runtime._watchJobId = jid
@@ -1933,8 +1984,9 @@ end
 ----------------------------------------------------------------
 -- ЖИЗНЕННЫЙ ЦИКЛ
 ----------------------------------------------------------------
-function App.Stop()
-    if not Runtime.running then return end
+function App.Stop(force)
+    if not force and ENV.__SoccerAuto_GEN ~= GEN then return end
+    if not Runtime.running and not force then return end
     Runtime.running = false
     for _, c in ipairs(Runtime.connections) do
         if c and type(c.Disconnect) == "function" then
@@ -1973,6 +2025,10 @@ function App.DisableKickHook()
     end
 end
 
+function App.Generation()
+    return GEN
+end
+
 function App.Status()
     local s = Runtime.stats
     local save = getSave()
@@ -1996,37 +2052,40 @@ function App.Status()
             petInfo = (" | pets=%d/%d"):format(type(items) == "table" and #items or 0, max or 0)
         end
     end
-    print(("[SoccerAuto] kicks=%d orbs=%d hatches=%d upgrades=%d claims=%d errors=%d running=%s playing=%s%s%s%s")
-        :format(s.kicks, s.orbs, s.hatches, s.upgrades, s.claims, s.errors,
-            tostring(Runtime.running), tostring(isPlaying()), credits, zoneInfo, petInfo))
+    print(("[SoccerAuto] gen=%d kicks=%d orbs=%d hatches=%d upgrades=%d claims=%d errors=%d running=%s playing=%s%s%s%s")
+        :format(GEN, s.kicks, s.orbs, s.hatches, s.upgrades, s.claims, s.errors,
+            tostring(alive()), tostring(isPlaying()), credits, zoneInfo, petInfo))
     return s
 end
 
 ----------------------------------------------------------------
 -- ЗАПУСК
 ----------------------------------------------------------------
-print(("[SoccerAuto] v5.20 старт | executor=%s"):format(tostring(U.identify())))
+print(("[SoccerAuto] v5.22 старт | gen=%d executor=%s"):format(GEN, tostring(U.identify())))
 
 ensureInSoccer()
 if CONFIG.AUTO_KICK then
     task.defer(function()
         task.wait(8)
-        if Runtime.running and inSoccer() and isPlaying() and not probeKickWorks() then
-            recoverBrokenKick("startup")
-        end
+        if not alive() or inRecovery() or not inSoccer() or not isPlaying() then return end
+        safe("kickProbe", function()
+            if not probeKickWorks() then recoverBrokenKick("startup") end
+        end)
     end)
 end
 if CONFIG.AUTO_EQUIP_PETS then
     task.defer(function()
         task.wait(2)
-        if Runtime.running then safe("equip", function() PetEquip.tick(true) end) end
+        if alive() and not inRecovery() then
+            safe("equip", function() PetEquip.tick(true) end)
+        end
     end)
 end
 if CONFIG.COLLECT_ORBS then safe("orbListeners", OrbCollector.setupListeners) end
 if CONFIG.AUTO_ZONE_PROGRESS then
     task.spawn(function()
         task.wait(2)
-        if Runtime.running and inSoccer() and not ZoneProgress.isComplete() then
+        if alive() and not inRecovery() and inSoccer() and not ZoneProgress.isComplete() then
             safe("zoneBoot", ZoneProgress.tick)
             print("[SoccerAuto] Авто-прогрессия зон: Shoot + покупка зон.")
         end
@@ -2050,10 +2109,14 @@ end
 -- Поток сбора орбов (высокая частота, не должен блокироваться)
 if CONFIG.COLLECT_ORBS then
     spawnLoop("orbs", function()
-        local n = 0
-        local ok, count = pcall(OrbCollector.tick)
-        if ok and type(count) == "number" then n = count end
-        task.wait(n > 0 and CONFIG.CLAIM_INTERVAL or (CONFIG.CLAIM_INTERVAL_IDLE or 0.65))
+        if inRecovery() then
+            task.wait(1.0)
+        else
+            local n = 0
+            local ok, count = pcall(OrbCollector.tick)
+            if ok and type(count) == "number" then n = count end
+            task.wait(n > 0 and CONFIG.CLAIM_INTERVAL or (CONFIG.CLAIM_INTERVAL_IDLE or 0.65))
+        end
     end)
 end
 
@@ -2077,8 +2140,12 @@ end
 
 if CONFIG.AUTO_EQUIP_PETS then
     spawnLoop("equip", function()
-        safe("equip", function() PetEquip.tick(false) end)
-        task.wait(CONFIG.EQUIP_BEST_INTERVAL or 30)
+        if inRecovery() then
+            task.wait(2.0)
+        else
+            safe("equip", function() PetEquip.tick(false) end)
+            task.wait(CONFIG.EQUIP_BEST_INTERVAL or 30)
+        end
     end)
 end
 
